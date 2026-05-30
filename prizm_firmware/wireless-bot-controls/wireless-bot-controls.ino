@@ -55,7 +55,8 @@ enum PrimitiveType
 {
     PRIM_NONE,
     PRIM_TURN,
-    PRIM_DRIVE
+    PRIM_DRIVE,
+    PRIM_CONT_DRIVE
 };
 
 PrimitiveType active_primitive = PRIM_NONE;
@@ -63,6 +64,7 @@ bool path_loaded = false;
 bool path_paused = false;
 bool path_started_sent = false;
 bool gripper_closed = false;
+bool reactive_replan_pending = false;
 
 const float POSITION_TOLERANCE_CM = 2.0;
 const float HEADING_TOLERANCE_DEG = 4.0;
@@ -83,9 +85,30 @@ uint8_t serialLineLength = 0;
 unsigned long lastTelemetrySendMs = 0;
 const unsigned long TELEMETRY_PERIOD_MS = 250;
 unsigned long lastSensorReadMs = 0;
-const unsigned long SENSOR_READ_PERIOD_MS = 500;
+const unsigned long SENSOR_READ_PERIOD_MS = 150;
+const unsigned long CLAW_SENSOR_READ_PERIOD_MS = 500;
+const unsigned long SONIC_TIMEOUT_US = 12000;
 int cached_left_ultrasonic_cm = -1;
+int cached_right_ultrasonic_cm = -1;
 int cached_front_ultrasonic_cm = -1;
+int cached_claw_ultrasonic_cm = -1;
+const bool USE_ULTRASONIC_SENSORS = true;
+const int RIGHT_FORWARD_ULTRASONIC_PIN = 3;
+const int CLAW_ULTRASONIC_PIN = 4;
+const int LEFT_FORWARD_ULTRASONIC_PIN = 5;
+const int FRONT_OBSTACLE_STOP_CM = 24;
+const int SIDE_OBSTACLE_BLOCKED_CM = 24;
+const int CONTINUOUS_DRIVE_STOP_CM = 32;
+const float REACTIVE_PIVOT_DEG = 45.0;
+const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
+const unsigned long REACTIVE_AVOID_COOLDOWN_MS = 1200;
+const bool PAUSE_AFTER_REACTIVE_PIVOT = true;
+int cached_front_ir_raw = -1;
+int cached_left_ir_raw = -1;
+int cached_front_ir_cm = -1;
+int cached_left_ir_cm = -1;
+unsigned long lastReactiveAvoidMs = 0;
+unsigned long lastClawSensorReadMs = 0;
 
 // ==============================
 // Helpers
@@ -228,6 +251,34 @@ void updateOdometry()
 // ==============================
 // Telemetry
 // ==============================
+int closestValidDistance(int a, int b)
+{
+    if (a > 0 && b > 0)
+        return min(a, b);
+    if (a > 0)
+        return a;
+    if (b > 0)
+        return b;
+    return -1;
+}
+
+int readSonicSensorCMFast(int pin)
+{
+    delayMicroseconds(300);
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(pin, LOW);
+    pinMode(pin, INPUT);
+
+    unsigned long duration = pulseIn(pin, HIGH, SONIC_TIMEOUT_US);
+    if (duration == 0)
+        return -1;
+    return (int)(duration / 29 / 2);
+}
+
 void maybeUpdateSensors()
 {
     unsigned long now = millis();
@@ -236,8 +287,28 @@ void maybeUpdateSensors()
     if (Serial.available() > 0 || espSerial.available() > 0)
         return;
 
-    cached_left_ultrasonic_cm = prizm.readSonicSensorCM(5);
-    cached_front_ultrasonic_cm = prizm.readSonicSensorCM(4);
+    if (USE_ULTRASONIC_SENSORS)
+    {
+        cached_right_ultrasonic_cm = readSonicSensorCMFast(RIGHT_FORWARD_ULTRASONIC_PIN);
+        cached_left_ultrasonic_cm = readSonicSensorCMFast(LEFT_FORWARD_ULTRASONIC_PIN);
+        if (now - lastClawSensorReadMs >= CLAW_SENSOR_READ_PERIOD_MS)
+        {
+            cached_claw_ultrasonic_cm = readSonicSensorCMFast(CLAW_ULTRASONIC_PIN);
+            lastClawSensorReadMs = now;
+        }
+        cached_front_ultrasonic_cm = closestValidDistance(cached_right_ultrasonic_cm, cached_left_ultrasonic_cm);
+    }
+    else
+    {
+        cached_left_ultrasonic_cm = -1;
+        cached_right_ultrasonic_cm = -1;
+        cached_front_ultrasonic_cm = -1;
+        cached_claw_ultrasonic_cm = -1;
+    }
+    cached_front_ir_raw = -1;
+    cached_left_ir_raw = -1;
+    cached_front_ir_cm = -1;
+    cached_left_ir_cm = -1;
     lastSensorReadMs = now;
 }
 
@@ -278,6 +349,24 @@ void printPoseJSON()
 
     broadcastPrint(F(",\"left_ultrasonic_cm\":"));
     broadcastPrintInt(cached_left_ultrasonic_cm);
+
+    broadcastPrint(F(",\"right_ultrasonic_cm\":"));
+    broadcastPrintInt(cached_right_ultrasonic_cm);
+
+    broadcastPrint(F(",\"claw_ultrasonic_cm\":"));
+    broadcastPrintInt(cached_claw_ultrasonic_cm);
+
+    broadcastPrint(F(",\"front_ir_raw\":"));
+    broadcastPrintInt(cached_front_ir_raw);
+
+    broadcastPrint(F(",\"left_ir_raw\":"));
+    broadcastPrintInt(cached_left_ir_raw);
+
+    broadcastPrint(F(",\"front_ir_cm\":"));
+    broadcastPrintInt(cached_front_ir_cm);
+
+    broadcastPrint(F(",\"left_ir_cm\":"));
+    broadcastPrintInt(cached_left_ir_cm);
 
     broadcastPrintLn(F("}"));
 }
@@ -334,6 +423,18 @@ void startDriveStraight(float distance_cm)
     setRobotState("executing_path");
 }
 
+void startContinuousDriveForward(int motor_power)
+{
+    interruptActivePrimitive();
+    clearCurrentPath();
+    motor_power = constrain(abs(motor_power), 15, 70);
+    resetEncoderTracking();
+    prizm.setMotorPower(1, motor_power);
+    prizm.setMotorPower(2, -motor_power);
+    active_primitive = PRIM_CONT_DRIVE;
+    setRobotState("manual_forward");
+}
+
 void startTurnInPlace(float robot_turn_deg)
 {
     int motor_deg = robotTurnDegToMotorDegrees(fabs(robot_turn_deg));
@@ -358,6 +459,71 @@ void startTurnInPlace(float robot_turn_deg)
 bool motorsBusy()
 {
     return (prizm.readMotorBusy(1) == 1 || prizm.readMotorBusy(2) == 1);
+}
+
+bool frontObstacleDetected()
+{
+    return cached_front_ultrasonic_cm > 0 &&
+           cached_front_ultrasonic_cm <= FRONT_OBSTACLE_STOP_CM;
+}
+
+bool leftObstacleDetected()
+{
+    return cached_left_ultrasonic_cm > 0 &&
+           cached_left_ultrasonic_cm <= SIDE_OBSTACLE_BLOCKED_CM;
+}
+
+bool rightObstacleDetected()
+{
+    return cached_right_ultrasonic_cm > 0 &&
+           cached_right_ultrasonic_cm <= SIDE_OBSTACLE_BLOCKED_CM;
+}
+
+bool continuousDriveFrontBlocked()
+{
+    return cached_front_ultrasonic_cm > 0 &&
+           cached_front_ultrasonic_cm <= CONTINUOUS_DRIVE_STOP_CM;
+}
+
+void maybeReactiveAvoidance()
+{
+    if (active_primitive == PRIM_CONT_DRIVE && continuousDriveFrontBlocked())
+    {
+        interruptActivePrimitive();
+        setRobotState("blocked");
+        sendStatus("blocked", "continuous_drive_obstacle");
+        printPoseJSON();
+        return;
+    }
+
+    if (active_primitive != PRIM_DRIVE)
+        return;
+    if (!frontObstacleDetected())
+        return;
+
+    unsigned long now = millis();
+    if (now - lastReactiveAvoidMs < REACTIVE_AVOID_COOLDOWN_MS)
+        return;
+    lastReactiveAvoidMs = now;
+
+    interruptActivePrimitive();
+    sendStatus("avoiding_obstacle", "front_ultrasonic");
+
+    float turn_deg = REACTIVE_PIVOT_DEG;
+    if (leftObstacleDetected() && !rightObstacleDetected())
+    {
+        turn_deg = -REACTIVE_PIVOT_DEG;
+    }
+    else if (rightObstacleDetected() && !leftObstacleDetected())
+    {
+        turn_deg = REACTIVE_PIVOT_DEG;
+    }
+    if (PAUSE_AFTER_REACTIVE_PIVOT)
+    {
+        path_paused = true;
+        reactive_replan_pending = true;
+    }
+    startTurnInPlace(turn_deg);
 }
 
 // ==============================
@@ -737,6 +903,25 @@ void handleStop(const char *json)
     performStop();
 }
 
+void handleContinuousDrive(const char *json)
+{
+    if (!jsonTargetsThisRobot(json))
+        return;
+
+    int motorPower = DEFAULT_CONTINUOUS_MOTOR_POWER;
+    if (!extractIntField(json, "motor_power", motorPower))
+    {
+        int driveSpeed = drive_speed_deg_per_sec;
+        if (extractIntField(json, "drive_speed_deg_per_sec", driveSpeed))
+            motorPower = driveSpeed / 6;
+    }
+
+    startContinuousDriveForward(motorPower);
+    sendAck("continuous_drive");
+    sendStatus("manual_forward", "continuous_drive_started");
+    printPoseJSON();
+}
+
 void handleToggleGripper(const char *json)
 {
     if (!jsonTargetsThisRobot(json))
@@ -780,6 +965,10 @@ void handleIncomingJson(const char *json)
     else if (jsonHasType(json, "stop"))
     {
         handleStop(json);
+    }
+    else if (jsonHasType(json, "continuous_drive"))
+    {
+        handleContinuousDrive(json);
     }
     else if (jsonHasType(json, "toggle_gripper"))
     {
@@ -844,8 +1033,12 @@ void updateActivePrimitive()
 
     updateOdometry();
 
+    if (active_primitive == PRIM_CONT_DRIVE)
+        return;
+
     if (!motorsBusy())
     {
+        PrimitiveType finished_primitive = active_primitive;
         if (active_primitive == PRIM_DRIVE)
         {
             sendWaypointReached();
@@ -853,6 +1046,15 @@ void updateActivePrimitive()
         }
 
         active_primitive = PRIM_NONE;
+
+        if (reactive_replan_pending && finished_primitive == PRIM_TURN)
+        {
+            reactive_replan_pending = false;
+            setRobotState("needs_replan");
+            sendStatus("needs_replan", "obstacle_scan_complete");
+            printPoseJSON();
+            return;
+        }
 
         if (path_paused)
         {
@@ -951,17 +1153,22 @@ void loop()
     readSerialCommands();
     readSerialCommands();
 
-    // 2. Update ongoing motion / odometry
+    // 2. Refresh sensors early so obstacle reaction uses current readings
+    maybeUpdateSensors();
+    maybeReactiveAvoidance();
+    readSerialCommands();
+
+    // 3. Update ongoing motion / odometry
     updateActivePrimitive();
     readSerialCommands();
 
-    // 3. Start next primitive if needed
+    // 4. Start next primitive if needed
     maybeStartNextPrimitive();
     readSerialCommands();
 
-    // 4. Refresh sensors only when the serial input is quiet
+    // 5. Refresh sensors only when the serial input is quiet
     maybeUpdateSensors();
 
-    // 5. Periodic telemetry
+    // 6. Periodic telemetry
     maybeSendTelemetry();
 }

@@ -2,8 +2,10 @@ import queue
 import tkinter as tk
 from tkinter import ttk
 from collections import defaultdict
+import json
 import math
 import time
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -11,7 +13,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MultipleLocator
-from matplotlib.patches import Polygon
+from matplotlib.patches import Polygon, Rectangle
 from itertools import cycle
 from messages import PauseMessage, ResumeMessage, StopMessage, ToggleGripperMessage, PathAssignmentMessage, Waypoint, MotionSettings
 
@@ -35,9 +37,13 @@ class TelemetryGUI:
     FRONT_SENSOR_LATERAL_OFFSET_CM = 0.0
     FRONT_SENSOR_ANGLE_OFFSET_DEG = 0.0
 
-    LEFT_SENSOR_FORWARD_OFFSET_CM = 0.0
+    LEFT_SENSOR_FORWARD_OFFSET_CM = 9.5
     LEFT_SENSOR_LATERAL_OFFSET_CM = 16.0
-    LEFT_SENSOR_ANGLE_OFFSET_DEG = 90.0
+    LEFT_SENSOR_ANGLE_OFFSET_DEG = 0.0
+
+    RIGHT_SENSOR_FORWARD_OFFSET_CM = 9.5
+    RIGHT_SENSOR_LATERAL_OFFSET_CM = -16.0
+    RIGHT_SENSOR_ANGLE_OFFSET_DEG = 0.0
 
     # Arena display settings: fixed 4m x 4m = 400cm x 400cm
     ARENA_SIZE_CM = 400
@@ -48,6 +54,7 @@ class TelemetryGUI:
     DEFAULT_TEST_DISTANCE_CM = 30.0
     DEFAULT_TURN_SPEED = 150
     DEFAULT_DRIVE_SPEED = 200
+    PERMANENT_OBSTACLES_PATH = Path(__file__).with_name("permanent_obstacles.json")
 
     # Robot safety box
     SAFETY_BOX_SIZE_CM = 40.0
@@ -57,6 +64,15 @@ class TelemetryGUI:
         self.root = tk.Tk()
         self.root.title("Robot Telemetry Dashboard")
         self.root.geometry("1600x900")
+        self.root.configure(bg="#f4f6f8")
+
+        style = ttk.Style(self.root)
+        style.configure("TFrame", background="#f4f6f8")
+        style.configure("TLabelframe", background="#f4f6f8")
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background="#f4f6f8", font=("Segoe UI", 9))
+        style.configure("TButton", font=("Segoe UI", 9), padding=(8, 4))
+        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"), padding=(8, 5))
 
         self.command_sender = command_sender
         self.telemetry_queue = queue.Queue()
@@ -73,15 +89,26 @@ class TelemetryGUI:
             "theta": [],
             "front_ultra": [],
             "left_ultra": [],
+            "right_ultra": [],
             "front_echo_t": [],
             "front_echo_x": [],
             "front_echo_y": [],
             "left_echo_t": [],
             "left_echo_x": [],
             "left_echo_y": [],
+            "right_echo_t": [],
+            "right_echo_x": [],
+            "right_echo_y": [],
         })
 
         self.robot_colors = {}
+        self.obstacle_cells = {}
+        self.permanent_obstacle_cells = self._load_permanent_obstacles()
+        self.priority_goal_cell = (5, 5)
+        self.priority_goal_cm = (
+            self.priority_goal_cell[1] * self.GRID_SPACING_CM + self.GRID_SPACING_CM / 2.0,
+            self.priority_goal_cell[0] * self.GRID_SPACING_CM + self.GRID_SPACING_CM / 2.0,
+        )
         self.color_cycle = cycle([
             "tab:blue",
             "tab:orange",
@@ -116,7 +143,7 @@ class TelemetryGUI:
         mainframe.pack(fill=tk.BOTH, expand=True)
 
         # Left panel: compact robot table
-        left_panel = ttk.Frame(mainframe, width=320)
+        left_panel = ttk.Frame(mainframe, width=380)
         left_panel.pack(side=tk.LEFT, fill=tk.Y, expand=False)
         left_panel.pack_propagate(False)
 
@@ -144,7 +171,7 @@ class TelemetryGUI:
         robots_frame = ttk.LabelFrame(scrollable_frame, text="Robots")
         robots_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(0, 8))
 
-        columns = ("robot_id", "state", "x", "y", "theta")
+        columns = ("robot_id", "state", "battery", "x", "y", "theta")
         self.tree = ttk.Treeview(robots_frame, columns=columns, show="headings", height=4)
 
         for col in columns:
@@ -152,6 +179,7 @@ class TelemetryGUI:
 
         self.tree.column("robot_id", width=80, anchor="center")
         self.tree.column("state", width=70, anchor="center")
+        self.tree.column("battery", width=60, anchor="center")
         self.tree.column("x", width=50, anchor="center")
         self.tree.column("y", width=50, anchor="center")
         self.tree.column("theta", width=60, anchor="center")
@@ -167,6 +195,7 @@ class TelemetryGUI:
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_panel)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_click)
 
         # Create Control Board  
         controls_frame = ttk.LabelFrame(scrollable_frame, text="Test Commands")
@@ -193,13 +222,23 @@ class TelemetryGUI:
             justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(controls_frame, text="Pause", command=self._send_pause).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Resume", command=self._send_resume).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Stop", command=self._send_stop).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Toggle Gripper", command=self._send_toggle_gripper).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Send Straight Test", command=self._send_straight_test_path).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Send 180 Turn Test", command=self._send_turnaround_test_path).pack(fill=tk.X, pady=2)
-        ttk.Button(controls_frame, text="Send L Test Path", command=self._send_test_path).pack(fill=tk.X, pady=2)
+        quick_buttons = ttk.Frame(controls_frame)
+        quick_buttons.pack(fill=tk.X, pady=(0, 4))
+        quick_buttons.columnconfigure((0, 1), weight=1, uniform="quick")
+        ttk.Button(quick_buttons, text="Pause", command=self._send_pause).grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(quick_buttons, text="Resume", command=self._send_resume).grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(quick_buttons, text="Stop", command=self._send_stop).grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(quick_buttons, text="Gripper", command=self._send_toggle_gripper).grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=2)
+
+        ttk.Button(controls_frame, text="Straight Test", command=self._send_straight_test_path).pack(fill=tk.X, pady=2)
+        ttk.Button(
+            controls_frame,
+            text="Drive Forward Until Stop",
+            command=self._send_continuous_drive,
+            style="Accent.TButton",
+        ).pack(fill=tk.X, pady=2)
+        ttk.Button(controls_frame, text="180 Turn Test", command=self._send_turnaround_test_path).pack(fill=tk.X, pady=2)
+        ttk.Button(controls_frame, text="L Test Path", command=self._send_test_path).pack(fill=tk.X, pady=2)
 
         coordination_frame = ttk.LabelFrame(scrollable_frame, text="Grid Coordination")
         coordination_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
@@ -266,6 +305,71 @@ class TelemetryGUI:
             command=self._send_two_robot_traverse,
         ).pack(fill=tk.X, pady=2)
 
+        task_frame = ttk.LabelFrame(scrollable_frame, text="Priority Task")
+        task_frame.pack(fill=tk.X, expand=False, padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(
+            task_frame,
+            text="Click the arena to choose a priority goal or paint known obstacle cells.",
+            wraplength=320,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(4, 6))
+
+        self.map_click_mode_var = tk.StringVar(value="goal")
+        mode_frame = ttk.Frame(task_frame)
+        mode_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Radiobutton(mode_frame, text="Goal", value="goal", variable=self.map_click_mode_var).pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_frame, text="Known obstacle", value="obstacle", variable=self.map_click_mode_var).pack(side=tk.LEFT, padx=(10, 0))
+
+        goal_frame = ttk.Frame(task_frame)
+        goal_frame.pack(fill=tk.X, pady=(4, 6))
+        goal_frame.columnconfigure((1, 3), weight=1)
+
+        ttk.Label(goal_frame, text="Goal row").grid(row=0, column=0, sticky="w")
+        self.priority_goal_row_var = tk.StringVar(value="5")
+        ttk.Entry(goal_frame, textvariable=self.priority_goal_row_var, width=6).grid(row=0, column=1, sticky="ew", padx=(6, 12))
+        ttk.Label(goal_frame, text="Goal col").grid(row=0, column=2, sticky="w")
+        self.priority_goal_col_var = tk.StringVar(value="5")
+        ttk.Entry(goal_frame, textvariable=self.priority_goal_col_var, width=6).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        self.task_summary_var = tk.StringVar(value="Goal cell (5, 5) selected.")
+        ttk.Label(
+            task_frame,
+            textvariable=self.task_summary_var,
+            wraplength=320,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        self.map_status_var = tk.StringVar(value="Mode: Goal | known obstacles: 0")
+        ttk.Label(
+            task_frame,
+            textvariable=self.map_status_var,
+            wraplength=320,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(
+            task_frame,
+            text="Dispatch Priority Task",
+            command=self._send_priority_dispatch,
+            style="Accent.TButton",
+        ).pack(fill=tk.X, pady=(2, 4))
+
+        ttk.Button(
+            task_frame,
+            text="Print Fleet Summary",
+            command=self._send_fleet_query,
+        ).pack(fill=tk.X, pady=2)
+
+        ttk.Button(
+            task_frame,
+            text="Clear Known Obstacles",
+            command=self._clear_permanent_obstacles,
+        ).pack(fill=tk.X, pady=2)
+
+        self.map_click_mode_var.trace_add("write", lambda *_: self._refresh_map_status())
+        self._refresh_map_status()
+
     def _get_robot_color(self, robot_id: str) -> str:
         if robot_id not in self.robot_colors:
             self.robot_colors[robot_id] = next(self.color_cycle)
@@ -320,6 +424,27 @@ class TelemetryGUI:
             hist["left_echo_x"].pop(0)
             hist["left_echo_y"].pop(0)
 
+        while hist["right_echo_t"] and hist["right_echo_t"][0] < cutoff_t_s:
+            hist["right_echo_t"].pop(0)
+            hist["right_echo_x"].pop(0)
+            hist["right_echo_y"].pop(0)
+
+    def _remember_obstacle_cell(self, x_cm: float, y_cm: float, t_s: float | None):
+        if not (0.0 <= x_cm <= self.ARENA_SIZE_CM and 0.0 <= y_cm <= self.ARENA_SIZE_CM):
+            return
+        row = int(y_cm // self.GRID_SPACING_CM)
+        col = int(x_cm // self.GRID_SPACING_CM)
+        self.obstacle_cells[(row, col)] = t_s if t_s is not None else time.time()
+
+    def _prune_obstacle_cells(self, current_t_s: float):
+        cutoff_t_s = current_t_s - self.ECHO_WINDOW_S
+        expired = [
+            cell for cell, seen_at in self.obstacle_cells.items()
+            if seen_at < cutoff_t_s
+        ]
+        for cell in expired:
+            self.obstacle_cells.pop(cell, None)
+
     def _process_queue(self):
         updated = False
 
@@ -335,6 +460,7 @@ class TelemetryGUI:
             theta = telemetry.get("theta_deg")
             front = telemetry.get("front_ultrasonic_cm")
             left = telemetry.get("left_ultrasonic_cm")
+            right = telemetry.get("right_ultrasonic_cm")
             t_s = float(t) / 1000.0 if t is not None else None
 
             if t is not None:
@@ -349,6 +475,8 @@ class TelemetryGUI:
                 hist["front_ultra"].append(float(front))
             if left is not None:
                 hist["left_ultra"].append(float(left))
+            if right is not None:
+                hist["right_ultra"].append(float(right))
 
             if x is not None and y is not None and theta is not None:
                 x = float(x)
@@ -367,6 +495,7 @@ class TelemetryGUI:
                         hist["front_echo_t"].append(t_s if t_s is not None else 0.0)
                         hist["front_echo_x"].append(ex)
                         hist["front_echo_y"].append(ey)
+                        self._remember_obstacle_cell(ex, ey, t_s)
 
                 if left is not None:
                     pt = self._compute_echo_point(
@@ -380,9 +509,25 @@ class TelemetryGUI:
                         hist["left_echo_t"].append(t_s if t_s is not None else 0.0)
                         hist["left_echo_x"].append(ex)
                         hist["left_echo_y"].append(ey)
+                        self._remember_obstacle_cell(ex, ey, t_s)
+
+                if right is not None:
+                    pt = self._compute_echo_point(
+                        x, y, theta, float(right),
+                        self.RIGHT_SENSOR_FORWARD_OFFSET_CM,
+                        self.RIGHT_SENSOR_LATERAL_OFFSET_CM,
+                        self.RIGHT_SENSOR_ANGLE_OFFSET_DEG,
+                    )
+                    if pt is not None:
+                        ex, ey = pt
+                        hist["right_echo_t"].append(t_s if t_s is not None else 0.0)
+                        hist["right_echo_x"].append(ex)
+                        hist["right_echo_y"].append(ey)
+                        self._remember_obstacle_cell(ex, ey, t_s)
 
             if t_s is not None:
                 self._prune_echo_history(hist, t_s)
+                self._prune_obstacle_cells(t_s)
 
             updated = True
 
@@ -470,6 +615,103 @@ class TelemetryGUI:
 
         ax.plot([sensor_x, ex], [sensor_y, ey], linestyle=linestyle, label=label, color=color)
 
+    def _cell_center_cm(self, cell: tuple[int, int]) -> tuple[float, float]:
+        row, col = cell
+        return (
+            col * self.GRID_SPACING_CM + self.GRID_SPACING_CM / 2.0,
+            row * self.GRID_SPACING_CM + self.GRID_SPACING_CM / 2.0,
+        )
+
+    def _load_permanent_obstacles(self) -> set[tuple[int, int]]:
+        try:
+            raw_cells = json.loads(self.PERMANENT_OBSTACLES_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+
+        cells = set()
+        for item in raw_cells:
+            try:
+                row, col = item
+            except (TypeError, ValueError):
+                continue
+            cells.add((
+                max(0, min(self.GRID_DIM_CELLS - 1, int(row))),
+                max(0, min(self.GRID_DIM_CELLS - 1, int(col))),
+            ))
+        return cells
+
+    def _save_permanent_obstacles(self) -> None:
+        raw_cells = sorted([list(cell) for cell in self.permanent_obstacle_cells])
+        self.PERMANENT_OBSTACLES_PATH.write_text(json.dumps(raw_cells, indent=2), encoding="utf-8")
+
+    def _set_priority_goal_cell(self, row: int, col: int, source: str = "manual") -> None:
+        row = max(0, min(self.GRID_DIM_CELLS - 1, int(row)))
+        col = max(0, min(self.GRID_DIM_CELLS - 1, int(col)))
+        self.priority_goal_cell = (row, col)
+        self.priority_goal_cm = self._cell_center_cm(self.priority_goal_cell)
+
+        if hasattr(self, "priority_goal_row_var"):
+            self.priority_goal_row_var.set(str(row))
+        if hasattr(self, "priority_goal_col_var"):
+            self.priority_goal_col_var.set(str(col))
+
+        if hasattr(self, "task_summary_var"):
+            if source == "click":
+                self.task_summary_var.set(f"Map goal selected: cell ({row}, {col}).")
+            else:
+                self.task_summary_var.set(f"Goal cell ({row}, {col}) selected.")
+
+    def _on_plot_click(self, event):
+        if event.inaxes != self.ax_traj or event.xdata is None or event.ydata is None:
+            return
+        if not (0.0 <= event.xdata <= self.ARENA_SIZE_CM and 0.0 <= event.ydata <= self.ARENA_SIZE_CM):
+            return
+
+        col = int(event.xdata // self.GRID_SPACING_CM)
+        row = int(event.ydata // self.GRID_SPACING_CM)
+        if self.map_click_mode_var.get() == "obstacle":
+            self._toggle_permanent_obstacle(row, col)
+        else:
+            self._set_priority_goal_cell(row, col, source="click")
+        self._refresh_plot()
+
+    def _toggle_permanent_obstacle(self, row: int, col: int) -> None:
+        cell = (
+            max(0, min(self.GRID_DIM_CELLS - 1, int(row))),
+            max(0, min(self.GRID_DIM_CELLS - 1, int(col))),
+        )
+        if cell in self.permanent_obstacle_cells:
+            self.permanent_obstacle_cells.remove(cell)
+        else:
+            self.permanent_obstacle_cells.add(cell)
+        self._save_permanent_obstacles()
+
+        if self.command_sender:
+            self.command_sender({
+                "type": "permanent_obstacle_update",
+                "action": "toggle",
+                "row": cell[0],
+                "col": cell[1],
+            })
+        self.task_summary_var.set(f"Known obstacle toggled at cell ({cell[0]}, {cell[1]}).")
+        self._refresh_map_status()
+
+    def _clear_permanent_obstacles(self) -> None:
+        self.permanent_obstacle_cells.clear()
+        self._save_permanent_obstacles()
+        if self.command_sender:
+            self.command_sender({"type": "permanent_obstacle_update", "action": "clear"})
+        self.task_summary_var.set("Known obstacle map cleared.")
+        self._refresh_map_status()
+        self._refresh_plot()
+
+    def _refresh_map_status(self) -> None:
+        mode = self.map_click_mode_var.get().strip() or "goal"
+        mode_label = "Known obstacle" if mode == "obstacle" else "Goal"
+        self.map_status_var.set(
+            f"Mode: {mode_label} | known obstacles: {len(self.permanent_obstacle_cells)}"
+        )
+
     # ----------------------------
     # Refresh UI
     # ----------------------------
@@ -483,6 +725,7 @@ class TelemetryGUI:
                 values=(
                     robot_id,
                     state.get("state", ""),
+                    f'{float(state.get("battery_percent", 0.0)):.1f}%',
                     round(float(state.get("x_cm", 0.0)), 2),
                     round(float(state.get("y_cm", 0.0)), 2),
                     round(float(state.get("theta_deg", 0.0)), 2),
@@ -492,7 +735,7 @@ class TelemetryGUI:
     def _refresh_plot(self):
         self.ax_traj.clear()
 
-        self.ax_traj.set_title("Robot Trajectory + Ultrasonic Points")
+        self.ax_traj.set_title("Arena Map - click to set priority task goal")
         self.ax_traj.set_xlabel("x (cm)")
         self.ax_traj.set_ylabel("y (cm)")
 
@@ -514,6 +757,59 @@ class TelemetryGUI:
         # Draw grids
         self.ax_traj.grid(which="major", linewidth=1.0)
         self.ax_traj.grid(which="minor", linewidth=0.3)
+
+        for row, col in self.obstacle_cells:
+            self.ax_traj.add_patch(
+                Rectangle(
+                    (col * self.GRID_SPACING_CM, row * self.GRID_SPACING_CM),
+                    self.GRID_SPACING_CM,
+                    self.GRID_SPACING_CM,
+                    facecolor="tab:red",
+                    edgecolor="none",
+                    alpha=0.18,
+                    label="remembered obstacle",
+                )
+            )
+
+        for row, col in self.permanent_obstacle_cells:
+            self.ax_traj.add_patch(
+                Rectangle(
+                    (col * self.GRID_SPACING_CM, row * self.GRID_SPACING_CM),
+                    self.GRID_SPACING_CM,
+                    self.GRID_SPACING_CM,
+                    facecolor="#4a5568",
+                    edgecolor="#1a202c",
+                    linewidth=0.8,
+                    alpha=0.65,
+                    label="known obstacle",
+                )
+            )
+
+        goal_x, goal_y = self.priority_goal_cm
+        goal_row, goal_col = self.priority_goal_cell
+        self.ax_traj.add_patch(
+            Rectangle(
+                (goal_col * self.GRID_SPACING_CM, goal_row * self.GRID_SPACING_CM),
+                self.GRID_SPACING_CM,
+                self.GRID_SPACING_CM,
+                facecolor="#f6d365",
+                edgecolor="#b7791f",
+                linewidth=1.5,
+                alpha=0.45,
+                label="priority goal",
+            )
+        )
+        self.ax_traj.scatter(
+            [goal_x],
+            [goal_y],
+            marker="*",
+            s=180,
+            color="#b7791f",
+            edgecolor="black",
+            linewidth=0.6,
+            label=f"goal ({goal_row}, {goal_col})",
+            zorder=7,
+        )
 
         for robot_id, hist in self.robot_history.items():
             xs = hist["x"]
@@ -591,6 +887,16 @@ class TelemetryGUI:
                     s=20,
                     alpha=0.75,
                     label=f"{robot_id} left hits",
+                    color=color,
+                )
+
+            if hist["right_echo_x"] and hist["right_echo_y"]:
+                self.ax_traj.scatter(
+                    hist["right_echo_x"],
+                    hist["right_echo_y"],
+                    s=20,
+                    alpha=0.75,
+                    label=f"{robot_id} right hits",
                     color=color,
                 )
 
@@ -684,6 +990,16 @@ class TelemetryGUI:
         )
 
         self.command_sender(msg)
+
+    def _send_continuous_drive(self):
+        robot_id = self._get_selected_robot_id()
+        if not robot_id or not self.command_sender:
+            return
+        self.command_sender({
+            "type": "continuous_drive",
+            "robot_id": robot_id,
+            "motor_power": 35,
+        })
 
     def _send_turnaround_test_path(self):
         robot_id = self._get_selected_robot_id()
@@ -791,6 +1107,43 @@ class TelemetryGUI:
                 {"robot_id": robot_two, "goal_row": goal_two[0], "goal_col": goal_two[1]},
             ],
         })
+
+    def _send_priority_dispatch(self):
+        if not self.command_sender:
+            return
+
+        goal = self._parse_goal_cell(self.priority_goal_row_var, self.priority_goal_col_var)
+        if goal is None:
+            self.task_summary_var.set("Goal cells must be integers from 0 to 39.")
+            return
+
+        self._set_priority_goal_cell(goal[0], goal[1])
+        self._refresh_plot()
+        self.task_summary_var.set(f"Dispatching priority task to cell ({goal[0]}, {goal[1]}).")
+        response = self.command_sender({
+            "type": "priority_dispatch",
+            "goal_row": goal[0],
+            "goal_col": goal[1],
+            "priority": 1,
+        })
+        if isinstance(response, dict):
+            ok = bool(response.get("ok"))
+            reason = str(response.get("reason", ""))
+        else:
+            ok = bool(response)
+            reason = ""
+        if not ok:
+            self.task_summary_var.set(f"Priority dispatch failed: {reason or 'unknown_error'}.")
+        else:
+            self.task_summary_var.set(f"Priority task sent to cell ({goal[0]}, {goal[1]}).")
+            if reason and reason != "dispatched":
+                self.task_summary_var.set(
+                    f"Priority task sent to cell ({goal[0]}, {goal[1]}): {reason}."
+                )
+
+    def _send_fleet_query(self):
+        if self.command_sender:
+            self.command_sender({"type": "fleet_query"})
     
 
     def _refresh_robot_selector(self):

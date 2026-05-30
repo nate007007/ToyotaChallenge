@@ -1,11 +1,20 @@
 import json
+import math
 from collections import deque
 import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional
 
+from fleet_features import (
+    TaskDatabase,
+    choose_priority_robot,
+    query_robots,
+    simulated_battery_percent,
+    summarize_robot,
+)
 from gui import TelemetryGUI
 
 HOST = "0.0.0.0"
@@ -13,6 +22,11 @@ PORT = 9000
 MAX_CLIENTS = 10
 GRID_CELL_CM = 10.0
 GRID_DIM_CELLS = 40
+ARENA_SIZE_CM = GRID_CELL_CM * GRID_DIM_CELLS
+OBSTACLE_MEMORY_S = 20.0
+MIN_OBSTACLE_SENSOR_CM = 2.0
+MAX_OBSTACLE_SENSOR_CM = 120.0
+PERMANENT_OBSTACLES_PATH = Path(__file__).with_name("permanent_obstacles.json")
 
 
 @dataclass
@@ -47,6 +61,35 @@ robots_by_id: Dict[str, int] = {}
 
 next_client_id = 1
 next_robot_path_id = 1000
+task_db = TaskDatabase()
+battery_by_robot: dict[str, float] = {}
+obstacle_cells: dict[tuple[int, int], float] = {}
+permanent_obstacle_cells: set[tuple[int, int]] = set()
+goal_by_robot: dict[str, tuple[int, int]] = {}
+
+
+def load_permanent_obstacle_cells() -> set[tuple[int, int]]:
+    try:
+        raw_cells = json.loads(PERMANENT_OBSTACLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    cells = set()
+    for item in raw_cells:
+        try:
+            row, col = item
+        except (TypeError, ValueError):
+            continue
+        cells.add((max(0, min(GRID_DIM_CELLS - 1, int(row))), max(0, min(GRID_DIM_CELLS - 1, int(col)))))
+    return cells
+
+
+def save_permanent_obstacle_cells() -> None:
+    cells = sorted([list(cell) for cell in permanent_obstacle_cells])
+    PERMANENT_OBSTACLES_PATH.write_text(json.dumps(cells, indent=2), encoding="utf-8")
+
+
+permanent_obstacle_cells = load_permanent_obstacle_cells()
 
 
 # ----------------------------
@@ -95,6 +138,8 @@ def get_robot_snapshot() -> dict:
                 "last_heartbeat": session.last_heartbeat,
                 "last_telemetry": session.last_telemetry,
                 "last_status": session.last_status,
+                "awaiting_path_complete": session.awaiting_path_complete,
+                "awaiting_path_ack": session.awaiting_path_ack,
             }
         return snapshot
 
@@ -115,6 +160,22 @@ def print_robot_table() -> None:
                 f"last_heartbeat={session.last_heartbeat:.1f}"
             )
         print("===================\n")
+
+
+def print_fleet_summary() -> None:
+    snapshot = get_robot_snapshot()
+    blocked = sorted(obstacle_cells_snapshot())
+    print("\n=== Fleet Summary ===")
+    if not snapshot:
+        print("(no robots available)")
+    for robot_id, robot in snapshot.items():
+        print(summarize_robot(robot_id, robot))
+    idle = query_robots(snapshot, state="idle")
+    healthy = query_robots(snapshot, min_battery=30.0)
+    print(f"idle={idle}")
+    print(f"battery>=30={healthy}")
+    print(f"remembered_obstacles={blocked[:20]} count={len(blocked)}")
+    print("=====================\n")
 
 
 def send_to_robot(robot_id: str, message: dict) -> bool:
@@ -244,6 +305,12 @@ def clamp_cell(value: int) -> int:
     return max(0, min(GRID_DIM_CELLS - 1, value))
 
 
+def cm_to_cell(x_cm: float, y_cm: float) -> tuple[int, int] | None:
+    if not (0.0 <= x_cm <= ARENA_SIZE_CM and 0.0 <= y_cm <= ARENA_SIZE_CM):
+        return None
+    return clamp_cell(int(y_cm // GRID_CELL_CM)), clamp_cell(int(x_cm // GRID_CELL_CM))
+
+
 def pose_to_cell(telemetry: dict) -> tuple[int, int] | None:
     try:
         x_cm = float(telemetry["x_cm"])
@@ -251,9 +318,7 @@ def pose_to_cell(telemetry: dict) -> tuple[int, int] | None:
     except (KeyError, TypeError, ValueError):
         return None
 
-    col = clamp_cell(int(x_cm // GRID_CELL_CM))
-    row = clamp_cell(int(y_cm // GRID_CELL_CM))
-    return row, col
+    return cm_to_cell(x_cm, y_cm)
 
 
 def cell_center_waypoint(cell: tuple[int, int]) -> dict:
@@ -262,6 +327,202 @@ def cell_center_waypoint(cell: tuple[int, int]) -> dict:
         "x_cm": col * GRID_CELL_CM + GRID_CELL_CM / 2.0,
         "y_cm": row * GRID_CELL_CM + GRID_CELL_CM / 2.0,
     }
+
+
+def prune_obstacle_cells() -> None:
+    now = time.time()
+    expired = [
+        cell for cell, seen_at in obstacle_cells.items()
+        if now - seen_at > OBSTACLE_MEMORY_S
+    ]
+    for cell in expired:
+        obstacle_cells.pop(cell, None)
+
+
+def remember_obstacle_cell(cell: tuple[int, int] | None) -> None:
+    if cell is not None:
+        obstacle_cells[cell] = time.time()
+
+
+def obstacle_cells_snapshot() -> set[tuple[int, int]]:
+    prune_obstacle_cells()
+    return set(obstacle_cells) | set(permanent_obstacle_cells)
+
+
+def update_permanent_obstacle_cell(action: str, row: int | None = None, col: int | None = None) -> bool:
+    action = str(action).lower()
+    cell = None
+    if row is not None and col is not None:
+        cell = (clamp_cell(int(row)), clamp_cell(int(col)))
+
+    if action == "clear":
+        permanent_obstacle_cells.clear()
+        save_permanent_obstacle_cells()
+        print("[MAP] cleared permanent obstacles")
+        return True
+    if cell is None:
+        return False
+    if action == "remove":
+        permanent_obstacle_cells.discard(cell)
+    elif action == "toggle":
+        if cell in permanent_obstacle_cells:
+            permanent_obstacle_cells.remove(cell)
+        else:
+            permanent_obstacle_cells.add(cell)
+    else:
+        permanent_obstacle_cells.add(cell)
+
+    save_permanent_obstacle_cells()
+    print(f"[MAP] permanent_obstacles={sorted(permanent_obstacle_cells)}")
+    return True
+
+
+def add_sensor_obstacles_from_telemetry(telemetry: dict) -> None:
+    """Convert range sensor readings into temporary blocked grid cells."""
+    try:
+        x = float(telemetry["x_cm"])
+        y = float(telemetry["y_cm"])
+        theta_deg = float(telemetry["theta_deg"])
+    except (KeyError, TypeError, ValueError):
+        return
+
+    sensors = (
+        ("front_ultrasonic_cm", 9.5, 0.0, 0.0),
+        ("left_ultrasonic_cm", 9.5, 16.0, 0.0),
+        ("right_ultrasonic_cm", 9.5, -16.0, 0.0),
+        ("front_ir_cm", 9.5, 0.0, 0.0),
+        ("left_ir_cm", 0.0, 16.0, 90.0),
+        ("right_ir_cm", 0.0, -16.0, -90.0),
+    )
+
+    theta_rad = math.radians(theta_deg)
+    for field, forward_offset, lateral_offset, angle_offset in sensors:
+        value = telemetry.get(field)
+        if value is None:
+            continue
+        try:
+            distance_cm = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not (MIN_OBSTACLE_SENSOR_CM <= distance_cm <= MAX_OBSTACLE_SENSOR_CM):
+            continue
+
+        sensor_x = x + forward_offset * math.cos(theta_rad) - lateral_offset * math.sin(theta_rad)
+        sensor_y = y + forward_offset * math.sin(theta_rad) + lateral_offset * math.cos(theta_rad)
+        ray_rad = math.radians(theta_deg + angle_offset)
+        obstacle_x = sensor_x + distance_cm * math.cos(ray_rad)
+        obstacle_y = sensor_y + distance_cm * math.sin(ray_rad)
+        remember_obstacle_cell(cm_to_cell(obstacle_x, obstacle_y))
+
+
+def dispatch_priority_task(goal_row: int, goal_col: int, priority: int = 1) -> tuple[bool, str]:
+    goal = (clamp_cell(goal_row), clamp_cell(goal_col))
+    task_id = task_db.create_task(
+        task_type="priority_dispatch",
+        priority=priority,
+        goal_row=goal[0],
+        goal_col=goal[1],
+        payload={"goal": {"row": goal[0], "col": goal[1]}},
+    )
+
+    snapshot = get_robot_snapshot()
+    robot_id = choose_priority_robot(snapshot, goal)
+    if robot_id is None:
+        reason = "no_available_robot"
+        print(f"[TASK {task_id}] No available robot for priority dispatch to {goal}")
+        return False, reason
+
+    robot = snapshot[robot_id]
+    start = pose_to_cell(robot.get("last_telemetry") or {})
+    blocked = obstacle_cells_snapshot()
+    if start is not None:
+        blocked.discard(start)
+    blocked.discard(goal)
+    path = plan_grid_path(start, goal, blocked) if start is not None else None
+    fallback_reason = ""
+    if start is None:
+        fallback_reason = "no_start_telemetry_fallback_direct_goal"
+        waypoints = [cell_center_waypoint(goal)]
+    elif path is None:
+        fallback_reason = "no_path_fallback_direct_goal"
+        waypoints = [cell_center_waypoint(goal)]
+    else:
+        waypoints = [cell_center_waypoint(cell) for cell in path[1:]]
+    if not waypoints:
+        waypoints = [cell_center_waypoint(goal)]
+
+    task_db.update_task(task_id, "assigned", robot_id=robot_id)
+    ok = queue_robot_path({
+        "type": "path_assignment",
+        "robot_id": robot_id,
+        "path_id": next_subpath_id(),
+        "replace_existing": True,
+        "waypoints": waypoints,
+        "motion": None,
+    })
+    task_db.update_task(task_id, "dispatched" if ok else "failed", robot_id=robot_id)
+    print(
+        f"[TASK {task_id}] priority dispatch robot={robot_id} "
+        f"goal={goal} waypoints={len(waypoints)} blocked={len(blocked)} ok={ok} "
+        f"fallback={fallback_reason!r}"
+    )
+    if ok:
+        return True, fallback_reason or "dispatched"
+    return False, "send_failed"
+
+
+def replan_robot_to_goal(robot_id: str) -> bool:
+    goal = goal_by_robot.get(robot_id)
+    if goal is None:
+        print(f"[REPLAN] No remembered goal for robot_id={robot_id}")
+        return False
+
+    with clients_lock:
+        client_id = robots_by_id.get(robot_id)
+        session = client_sessions.get(client_id) if client_id is not None else None
+        if session is None:
+            print(f"[REPLAN] No connected session for robot_id={robot_id}")
+            return False
+
+        start = pose_to_cell(session.last_telemetry or {})
+        motion = dict(session.pending_motion) if isinstance(session.pending_motion, dict) else None
+
+    if start is None:
+        print(f"[REPLAN] Need telemetry before replanning robot_id={robot_id}")
+        return False
+
+    blocked = obstacle_cells_snapshot()
+    blocked.discard(start)
+    blocked.discard(goal)
+    path = plan_grid_path(start, goal, blocked)
+    if path is None:
+        print(f"[REPLAN] No path robot_id={robot_id} start={start} goal={goal} blocked={len(blocked)}")
+        return False
+
+    waypoints = [cell_center_waypoint(cell) for cell in path[1:]]
+    if not waypoints:
+        print(f"[REPLAN] robot_id={robot_id} already at goal={goal}")
+        return False
+
+    with clients_lock:
+        client_id = robots_by_id.get(robot_id)
+        session = client_sessions.get(client_id) if client_id is not None else None
+        if session is None:
+            return False
+        session.pending_waypoints = waypoints
+        session.pending_motion = motion
+        session.sequence_path_id = next_subpath_id()
+        session.active_subpath_id = None
+        session.awaiting_path_ack = False
+        session.awaiting_path_complete = False
+        session.state = "replanning"
+
+    print(
+        f"[REPLAN] robot_id={robot_id} start={start} goal={goal} "
+        f"waypoints={len(waypoints)} blocked={len(blocked)}"
+    )
+    maybe_dispatch_waiting_sequences()
+    return True
 
 
 def plan_grid_path(
@@ -347,12 +608,18 @@ def start_coordinated_traverse(message: dict) -> bool:
         print("[COORD] Robots cannot share the same goal cell")
         return False
 
-    path_one = plan_grid_path(start_one, goal_one, {start_two})
+    dynamic_blocked = obstacle_cells_snapshot()
+    dynamic_blocked.discard(start_one)
+    dynamic_blocked.discard(start_two)
+    dynamic_blocked.discard(goal_one)
+    dynamic_blocked.discard(goal_two)
+
+    path_one = plan_grid_path(start_one, goal_one, dynamic_blocked | {start_two})
     if path_one is None:
         print(f"[COORD] No path found for {robot_one_id} from {start_one} to {goal_one}")
         return False
 
-    path_two = plan_grid_path(start_two, goal_two, {goal_one})
+    path_two = plan_grid_path(start_two, goal_two, dynamic_blocked | {goal_one})
     if path_two is None:
         print(f"[COORD] No path found for {robot_two_id} from {start_two} to {goal_two}")
         return False
@@ -401,6 +668,14 @@ def queue_robot_path(message: dict) -> bool:
         print(f"[SEQUENCE] Refusing to queue empty path for {robot_id}")
         return False
 
+    final_waypoint = waypoints[-1]
+    final_goal = pose_to_cell({
+        "x_cm": final_waypoint["x_cm"],
+        "y_cm": final_waypoint["y_cm"],
+    })
+    if final_goal is not None:
+        goal_by_robot[robot_id] = final_goal
+
     with clients_lock:
         client_id = robots_by_id.get(robot_id)
         if client_id is None:
@@ -441,16 +716,39 @@ def gui_command_sender(message_obj):
                 print("[GUI SEND] Started coordinated two-robot traverse")
             else:
                 print("[GUI SEND] Failed to start coordinated two-robot traverse")
-            return
+            return ok
+
+        if message.get("type") == "priority_dispatch":
+            goal_row = int(message.get("goal_row", 0))
+            goal_col = int(message.get("goal_col", 0))
+            priority = int(message.get("priority", 1))
+            ok, reason = dispatch_priority_task(goal_row, goal_col, priority)
+            if ok:
+                print(f"[GUI SEND] Started priority dispatch ({reason})")
+            else:
+                print(f"[GUI SEND] Failed priority dispatch ({reason})")
+            return {"ok": ok, "reason": reason}
+
+        if message.get("type") == "fleet_query":
+            print_fleet_summary()
+            return True
+
+        if message.get("type") == "permanent_obstacle_update":
+            ok = update_permanent_obstacle_cell(
+                message.get("action", "toggle"),
+                message.get("row"),
+                message.get("col"),
+            )
+            return ok
 
         if not robot_id:
             print("[GUI SEND] Refusing to send message with no robot_id")
-            return
+            return False
 
         if message.get("type") == "path_assignment":
             ok = queue_robot_path(message)
         else:
-            if message.get("type") == "stop":
+            if message.get("type") in {"stop", "continuous_drive"}:
                 with clients_lock:
                     client_id = robots_by_id.get(robot_id)
                     session = client_sessions.get(client_id) if client_id is not None else None
@@ -463,9 +761,11 @@ def gui_command_sender(message_obj):
             print(f"[GUI SEND] Sent {message.get('type')} to {robot_id}")
         else:
             print(f"[GUI SEND] Failed to send {message.get('type')} to {robot_id}")
+        return ok
 
     except Exception as exc:
         print(f"[GUI SEND] Error building/sending message: {exc}")
+        return False
 
 
 # Initialize GUI
@@ -538,6 +838,14 @@ def handle_telemetry(client_id: int, msg: dict) -> None:
 
     with clients_lock:
         session = client_sessions[client_id]
+        robot_id = session.robot_id or str(msg.get("robot_id", f"client_{client_id}"))
+        msg["battery_percent"] = simulated_battery_percent(
+            robot_id,
+            msg,
+            battery_by_robot.get(robot_id),
+        )
+        battery_by_robot[robot_id] = msg["battery_percent"]
+        add_sensor_obstacles_from_telemetry(msg)
         session.last_telemetry = msg
 
     if session.robot_id:
@@ -564,6 +872,9 @@ def handle_status(client_id: int, msg: dict) -> None:
 
     robot_label = session.robot_id if session.robot_id else f"client_{client_id}"
     print(f"[{robot_label}] status: {msg}")
+
+    if msg.get("state") == "needs_replan" and session.robot_id:
+        replan_robot_to_goal(session.robot_id)
 
 
 def handle_path_event(client_id: int, msg: dict) -> None:

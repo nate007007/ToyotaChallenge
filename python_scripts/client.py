@@ -69,12 +69,14 @@ FORWARD_TO_ROBOT_TYPES = {
     "resume",
     "stop",
     "toggle_gripper",
+    "continuous_drive",
 }
 
 serial_write_lock = threading.Lock()
 
 DEFAULT_TURN_SPEED = 150
 DEFAULT_DRIVE_SPEED = 200
+PATH_ASSIGNMENT_SETTLE_S = 0.08
 SERIAL_RETRY_COUNTS = {
     "pause": 5,
     "stop": 5,
@@ -155,7 +157,7 @@ def send_json_line_over_transport(transport: RobotTransport, payload: dict) -> N
         # For large JSON Commands, stop Robot Telemetry Data from Coming in
         if payload.get("type") == "path_assignment":
             transport.write("S\n")                      # Stop the Robot
-            time.sleep(0.8)                             # Delay for Buffer
+            time.sleep(PATH_ASSIGNMENT_SETTLE_S)        # Briefly let the stop command clear
 
         for attempt in range(retry_count):
             transport.write(message)
