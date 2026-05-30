@@ -94,7 +94,7 @@ def choose_priority_robot(snapshot: dict, goal_cell: tuple[int, int]) -> str | N
     if not candidates:
         return None
     candidates.sort()
-    return candidates[0][2]
+    return candidates[0][3]
 
 
 @dataclass

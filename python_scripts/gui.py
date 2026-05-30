@@ -190,7 +190,7 @@ class TelemetryGUI:
         right_panel = ttk.Frame(mainframe)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        self.fig = Figure(figsize=(10, 8), tight_layout=True)
+        self.fig = Figure(figsize=(10, 8), tight_layout=True, facecolor="#f4f6f8")
         self.ax_traj = self.fig.add_subplot(111)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right_panel)
@@ -615,6 +615,30 @@ class TelemetryGUI:
 
         ax.plot([sensor_x, ex], [sensor_y, ey], linestyle=linestyle, label=label, color=color)
 
+    def _draw_sensor_marker(
+        self,
+        ax,
+        x: float,
+        y: float,
+        theta_deg: float,
+        forward_offset_cm: float,
+        lateral_offset_cm: float,
+        color: str,
+    ):
+        sensor_x, sensor_y = self._world_sensor_position(
+            x, y, theta_deg, forward_offset_cm, lateral_offset_cm
+        )
+        ax.scatter(
+            [sensor_x],
+            [sensor_y],
+            s=28,
+            marker="s",
+            facecolor="white",
+            edgecolor=color,
+            linewidth=1.4,
+            zorder=6,
+        )
+
     def _cell_center_cm(self, cell: tuple[int, int]) -> tuple[float, float]:
         row, col = cell
         return (
@@ -735,9 +759,13 @@ class TelemetryGUI:
     def _refresh_plot(self):
         self.ax_traj.clear()
 
-        self.ax_traj.set_title("Arena Map - click to set priority task goal")
-        self.ax_traj.set_xlabel("x (cm)")
-        self.ax_traj.set_ylabel("y (cm)")
+        self.ax_traj.set_facecolor("#fbfcfe")
+        self.ax_traj.set_title(
+            "Arena Map  ·  click to set priority goal",
+            fontsize=12, fontweight="bold", color="#2d3748", pad=10,
+        )
+        self.ax_traj.set_xlabel("x (cm)", color="#4a5568")
+        self.ax_traj.set_ylabel("y (cm)", color="#4a5568")
 
         # Arena is 0 → 400 cm
         self.ax_traj.set_xlim(0, self.ARENA_SIZE_CM)
@@ -755,8 +783,11 @@ class TelemetryGUI:
         self.ax_traj.yaxis.set_minor_locator(MultipleLocator(10))
 
         # Draw grids
-        self.ax_traj.grid(which="major", linewidth=1.0)
-        self.ax_traj.grid(which="minor", linewidth=0.3)
+        self.ax_traj.grid(which="major", linewidth=0.8, color="#cbd5e0")
+        self.ax_traj.grid(which="minor", linewidth=0.3, color="#e2e8f0")
+        self.ax_traj.tick_params(colors="#718096", labelsize=8)
+        for spine in self.ax_traj.spines.values():
+            spine.set_edgecolor("#cbd5e0")
 
         for row, col in self.obstacle_cells:
             self.ax_traj.add_patch(
@@ -833,6 +864,8 @@ class TelemetryGUI:
                     head_width=3.0,
                     head_length=4.0,
                     length_includes_head=True,
+                    color=color,
+                    zorder=6,
                 )
 
                 # Robot center point
@@ -855,55 +888,66 @@ class TelemetryGUI:
                     color=color,
                 )
 
-                if hist["front_ultra"]:
+                # Mark the two real forward ultrasonics at their mounted
+                # corners and draw their latest rays. There is no physical
+                # center sensor, so nothing is drawn at the robot midline.
+                self._draw_sensor_marker(
+                    self.ax_traj, xs[-1], ys[-1], theta_deg,
+                    self.LEFT_SENSOR_FORWARD_OFFSET_CM,
+                    self.LEFT_SENSOR_LATERAL_OFFSET_CM,
+                    color,
+                )
+                self._draw_sensor_marker(
+                    self.ax_traj, xs[-1], ys[-1], theta_deg,
+                    self.RIGHT_SENSOR_FORWARD_OFFSET_CM,
+                    self.RIGHT_SENSOR_LATERAL_OFFSET_CM,
+                    color,
+                )
+
+                if hist["left_ultra"]:
                     self._draw_latest_ray(
-                        self.ax_traj,
-                        xs[-1],
-                        ys[-1],
-                        theta_deg,
-                        hist["front_ultra"][-1],
-                        self.FRONT_SENSOR_FORWARD_OFFSET_CM,
-                        self.FRONT_SENSOR_LATERAL_OFFSET_CM,
-                        self.FRONT_SENSOR_ANGLE_OFFSET_DEG,
-                        label=f"{robot_id} latest front ray",
-                        linestyle="--",
-                        color=color,
+                        self.ax_traj, xs[-1], ys[-1], theta_deg,
+                        hist["left_ultra"][-1],
+                        self.LEFT_SENSOR_FORWARD_OFFSET_CM,
+                        self.LEFT_SENSOR_LATERAL_OFFSET_CM,
+                        self.LEFT_SENSOR_ANGLE_OFFSET_DEG,
+                        label=None, linestyle=":", color=color,
+                    )
+                if hist["right_ultra"]:
+                    self._draw_latest_ray(
+                        self.ax_traj, xs[-1], ys[-1], theta_deg,
+                        hist["right_ultra"][-1],
+                        self.RIGHT_SENSOR_FORWARD_OFFSET_CM,
+                        self.RIGHT_SENSOR_LATERAL_OFFSET_CM,
+                        self.RIGHT_SENSOR_ANGLE_OFFSET_DEG,
+                        label=None, linestyle="--", color=color,
                     )
 
-            if hist["front_echo_x"] and hist["front_echo_y"]:
+            hit_xs = hist["left_echo_x"] + hist["right_echo_x"]
+            hit_ys = hist["left_echo_y"] + hist["right_echo_y"]
+            if hit_xs and hit_ys:
                 self.ax_traj.scatter(
-                    hist["front_echo_x"],
-                    hist["front_echo_y"],
-                    s=20,
-                    alpha=0.75,
-                    label=f"{robot_id} front hits",
-                    color=color,
-                )
-
-            if hist["left_echo_x"] and hist["left_echo_y"]:
-                self.ax_traj.scatter(
-                    hist["left_echo_x"],
-                    hist["left_echo_y"],
-                    s=20,
-                    alpha=0.75,
-                    label=f"{robot_id} left hits",
-                    color=color,
-                )
-
-            if hist["right_echo_x"] and hist["right_echo_y"]:
-                self.ax_traj.scatter(
-                    hist["right_echo_x"],
-                    hist["right_echo_y"],
-                    s=20,
-                    alpha=0.75,
-                    label=f"{robot_id} right hits",
+                    hit_xs,
+                    hit_ys,
+                    s=18,
+                    alpha=0.7,
+                    label=f"{robot_id} sensor hits",
                     color=color,
                 )
 
         handles, labels = self.ax_traj.get_legend_handles_labels()
         unique = dict(zip(labels, handles))
         if unique:
-            self.ax_traj.legend(unique.values(), unique.keys(), loc="best")
+            legend = self.ax_traj.legend(
+                unique.values(),
+                unique.keys(),
+                loc="upper left",
+                fontsize=7.5,
+                framealpha=0.9,
+                edgecolor="#cbd5e0",
+                ncol=2 if len(unique) > 8 else 1,
+            )
+            legend.get_frame().set_facecolor("#ffffff")
 
         self.canvas.draw()
     

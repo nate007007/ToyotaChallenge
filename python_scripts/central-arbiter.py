@@ -387,10 +387,8 @@ def add_sensor_obstacles_from_telemetry(telemetry: dict) -> None:
         return
 
     sensors = (
-        ("front_ultrasonic_cm", 9.5, 0.0, 0.0),
         ("left_ultrasonic_cm", 9.5, 16.0, 0.0),
         ("right_ultrasonic_cm", 9.5, -16.0, 0.0),
-        ("front_ir_cm", 9.5, 0.0, 0.0),
         ("left_ir_cm", 0.0, 16.0, 90.0),
         ("right_ir_cm", 0.0, -16.0, -90.0),
     )

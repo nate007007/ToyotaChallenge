@@ -59,7 +59,6 @@ bool path_loaded = false;
 bool path_paused = false;
 bool path_started_sent = false;
 bool gripper_closed = false;
-bool reactive_replan_pending = false;
 
 const float POSITION_TOLERANCE_CM = 2.0;
 const float HEADING_TOLERANCE_DEG = 4.0;
@@ -80,9 +79,16 @@ uint8_t serialLineLength = 0;
 unsigned long lastTelemetrySendMs = 0;
 const unsigned long TELEMETRY_PERIOD_MS = 250;
 unsigned long lastSensorReadMs = 0;
-const unsigned long SENSOR_READ_PERIOD_MS = 150;
+const unsigned long SENSOR_READ_PERIOD_MS = 80;
 const unsigned long CLAW_SENSOR_READ_PERIOD_MS = 500;
-const unsigned long SONIC_TIMEOUT_US = 12000;
+const unsigned long SONIC_TIMEOUT_US = 8000;
+// Obstacle confirmation: a forward sensor must read within its clearance for
+// this many consecutive samples before we treat it as a real obstacle. This
+// rejects single-sample dropouts/spikes from the ultrasonics.
+const int OBSTACLE_CONFIRM_SAMPLES = 2;
+// If a sensor returns no echo, hold its last valid reading for this long
+// before declaring the reading stale (-1).
+const unsigned long SENSOR_VALID_HOLD_MS = 500;
 int cached_left_ultrasonic_cm = -1;
 int cached_right_ultrasonic_cm = -1;
 int cached_front_ultrasonic_cm = -1;
@@ -91,19 +97,24 @@ const bool USE_ULTRASONIC_SENSORS = true;
 const int RIGHT_FORWARD_ULTRASONIC_PIN = 3;
 const int CLAW_ULTRASONIC_PIN = 4;
 const int LEFT_FORWARD_ULTRASONIC_PIN = 5;
-const int FRONT_OBSTACLE_STOP_CM = 24;
-const int SIDE_OBSTACLE_BLOCKED_CM = 24;
-const int CONTINUOUS_DRIVE_STOP_CM = 32;
-const float REACTIVE_PIVOT_DEG = 45.0;
+// Stop clearances measured at the two forward ultrasonics, in cm.
+// Each side has its own target gap, and the gap shrinks when the claw is
+// closed (the claw extends the robot's reach, so it can approach closer).
+const float LEFT_STOP_CLAW_OPEN_CM = 15.5;
+const float LEFT_STOP_CLAW_CLOSED_CM = 13.0;
+const float RIGHT_STOP_CLAW_OPEN_CM = 12.5;
+const float RIGHT_STOP_CLAW_CLOSED_CM = 10.0;
 const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
-const unsigned long REACTIVE_AVOID_COOLDOWN_MS = 1200;
-const bool PAUSE_AFTER_REACTIVE_PIVOT = true;
 int cached_front_ir_raw = -1;
 int cached_left_ir_raw = -1;
 int cached_front_ir_cm = -1;
 int cached_left_ir_cm = -1;
-unsigned long lastReactiveAvoidMs = 0;
 unsigned long lastClawSensorReadMs = 0;
+// Forward ultrasonic filter state (per side).
+unsigned long leftUltraValidMs = 0;
+unsigned long rightUltraValidMs = 0;
+int leftCloseStreak = 0;
+int rightCloseStreak = 0;
 
 // ==============================
 // Helpers
@@ -237,19 +248,48 @@ int readSonicSensorCMFast(int pin)
   return (int)(duration / 29 / 2);
 }
 
+// Fold one raw ultrasonic sample into the filtered state for one side.
+// Holds the last valid reading across brief dropouts and requires a streak of
+// in-clearance samples before the obstacle is considered confirmed.
+void updateForwardFilter(int raw, int &cached, unsigned long &lastValidMs,
+                         int &closeStreak, float clearanceCm, unsigned long now)
+{
+  if (raw > 0)
+  {
+    cached = raw;
+    lastValidMs = now;
+    if ((float)raw <= clearanceCm)
+    {
+      if (closeStreak < OBSTACLE_CONFIRM_SAMPLES)
+        closeStreak++;
+    }
+    else
+    {
+      closeStreak = 0;
+    }
+  }
+  else if (now - lastValidMs > SENSOR_VALID_HOLD_MS)
+  {
+    cached = -1;
+    closeStreak = 0;
+  }
+}
+
 void maybeUpdateSensors()
 {
   unsigned long now = millis();
 
   if (now - lastSensorReadMs < SENSOR_READ_PERIOD_MS)
     return;
-  if (Serial.available() > 0)
-    return;
 
   if (USE_ULTRASONIC_SENSORS)
   {
-    cached_right_ultrasonic_cm = readSonicSensorCMFast(RIGHT_FORWARD_ULTRASONIC_PIN);
-    cached_left_ultrasonic_cm = readSonicSensorCMFast(LEFT_FORWARD_ULTRASONIC_PIN);
+    int raw_right = readSonicSensorCMFast(RIGHT_FORWARD_ULTRASONIC_PIN);
+    int raw_left = readSonicSensorCMFast(LEFT_FORWARD_ULTRASONIC_PIN);
+    updateForwardFilter(raw_right, cached_right_ultrasonic_cm, rightUltraValidMs,
+                        rightCloseStreak, rightStopClearanceCm(), now);
+    updateForwardFilter(raw_left, cached_left_ultrasonic_cm, leftUltraValidMs,
+                        leftCloseStreak, leftStopClearanceCm(), now);
     if (now - lastClawSensorReadMs >= CLAW_SENSOR_READ_PERIOD_MS)
     {
       cached_claw_ultrasonic_cm = readSonicSensorCMFast(CLAW_ULTRASONIC_PIN);
@@ -263,6 +303,8 @@ void maybeUpdateSensors()
     cached_right_ultrasonic_cm = -1;
     cached_front_ultrasonic_cm = -1;
     cached_claw_ultrasonic_cm = -1;
+    leftCloseStreak = 0;
+    rightCloseStreak = 0;
   }
   cached_front_ir_raw = -1;
   cached_left_ir_raw = -1;
@@ -414,69 +456,57 @@ bool motorsBusy()
   return (prizm.readMotorBusy(1) == 1 || prizm.readMotorBusy(2) == 1);
 }
 
-bool frontObstacleDetected()
+float leftStopClearanceCm()
 {
-  return cached_front_ultrasonic_cm > 0 &&
-         cached_front_ultrasonic_cm <= FRONT_OBSTACLE_STOP_CM;
+  return gripper_closed ? LEFT_STOP_CLAW_CLOSED_CM : LEFT_STOP_CLAW_OPEN_CM;
+}
+
+float rightStopClearanceCm()
+{
+  return gripper_closed ? RIGHT_STOP_CLAW_CLOSED_CM : RIGHT_STOP_CLAW_OPEN_CM;
 }
 
 bool leftObstacleDetected()
 {
-  return cached_left_ultrasonic_cm > 0 &&
-         cached_left_ultrasonic_cm <= SIDE_OBSTACLE_BLOCKED_CM;
+  return leftCloseStreak >= OBSTACLE_CONFIRM_SAMPLES;
 }
 
 bool rightObstacleDetected()
 {
-  return cached_right_ultrasonic_cm > 0 &&
-         cached_right_ultrasonic_cm <= SIDE_OBSTACLE_BLOCKED_CM;
+  return rightCloseStreak >= OBSTACLE_CONFIRM_SAMPLES;
 }
 
-bool continuousDriveFrontBlocked()
+bool frontObstacleDetected()
 {
-  return cached_front_ultrasonic_cm > 0 &&
-         cached_front_ultrasonic_cm <= CONTINUOUS_DRIVE_STOP_CM;
+  return leftObstacleDetected() || rightObstacleDetected();
 }
 
+// A confirmed forward obstacle is a hard stop in both drive modes. Manual
+// continuous driving simply halts and reports "blocked". Autonomous path
+// driving halts and asks the arbiter to replan around the newly seen wall,
+// since blindly pivoting can't know which way is actually clear.
 void maybeReactiveAvoidance()
 {
-  if (active_primitive == PRIM_CONT_DRIVE && continuousDriveFrontBlocked())
+  if (active_primitive != PRIM_DRIVE && active_primitive != PRIM_CONT_DRIVE)
+    return;
+  if (!frontObstacleDetected())
+    return;
+
+  PrimitiveType blocked_mode = active_primitive;
+  interruptActivePrimitive();
+
+  if (blocked_mode == PRIM_CONT_DRIVE)
   {
-    interruptActivePrimitive();
     setRobotState("blocked");
     sendStatus("blocked", "continuous_drive_obstacle");
     printPoseJSON();
     return;
   }
 
-  if (active_primitive != PRIM_DRIVE)
-    return;
-  if (!frontObstacleDetected())
-    return;
-
-  unsigned long now = millis();
-  if (now - lastReactiveAvoidMs < REACTIVE_AVOID_COOLDOWN_MS)
-    return;
-  lastReactiveAvoidMs = now;
-
-  interruptActivePrimitive();
-  sendStatus("avoiding_obstacle", "front_ultrasonic");
-
-  float turn_deg = REACTIVE_PIVOT_DEG;
-  if (leftObstacleDetected() && !rightObstacleDetected())
-  {
-    turn_deg = -REACTIVE_PIVOT_DEG;
-  }
-  else if (rightObstacleDetected() && !leftObstacleDetected())
-  {
-    turn_deg = REACTIVE_PIVOT_DEG;
-  }
-  if (PAUSE_AFTER_REACTIVE_PIVOT)
-  {
-    path_paused = true;
-    reactive_replan_pending = true;
-  }
-  startTurnInPlace(turn_deg);
+  path_paused = true;
+  setRobotState("needs_replan");
+  sendStatus("needs_replan", "forward_clearance_reached");
+  printPoseJSON();
 }
 
 // ==============================
@@ -971,7 +1001,6 @@ void updateActivePrimitive()
 
   if (!motorsBusy())
   {
-    PrimitiveType finished_primitive = active_primitive;
     if (active_primitive == PRIM_DRIVE)
     {
       sendWaypointReached();
@@ -979,15 +1008,6 @@ void updateActivePrimitive()
     }
 
     active_primitive = PRIM_NONE;
-
-    if (reactive_replan_pending && finished_primitive == PRIM_TURN)
-    {
-      reactive_replan_pending = false;
-      setRobotState("needs_replan");
-      sendStatus("needs_replan", "obstacle_scan_complete");
-      printPoseJSON();
-      return;
-    }
 
     if (path_paused)
     {
