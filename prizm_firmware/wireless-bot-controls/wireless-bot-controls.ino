@@ -85,11 +85,13 @@ int drive_speed_deg_per_sec = 200;
 // ==============================
 // Serial receive buffer
 // ==============================
-// A full 12-waypoint path_assignment (with a motion block) is ~527 bytes, so
-// the buffer needs headroom past that. The length counter MUST be wide enough
-// to index the whole buffer: a uint8_t wraps at 256 and silently corrupts any
-// message longer than 255 bytes, which is what dropped most dispatch commands.
-const int SERIAL_LINE_BUFFER_SIZE = 768;
+// The PRIZM is an ATmega328P with only 2 KB of SRAM, so this buffer stays at
+// 512 bytes -- growing it crashes the board. The arbiter caps each
+// path_assignment (MAX_WAYPOINTS_PER_ASSIGNMENT) so messages stay well under
+// this size. The length counter MUST be wide enough to index the whole buffer:
+// a uint8_t wraps at 256 and silently corrupts any message longer than 255
+// bytes, which is what was dropping most dispatch commands.
+const int SERIAL_LINE_BUFFER_SIZE = 512;
 char serialLineBuffer[SERIAL_LINE_BUFFER_SIZE];
 uint16_t serialLineLength = 0;
 bool serialLineOverflow = false;
