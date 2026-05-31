@@ -22,6 +22,42 @@ WiFiClient client;
 
 bool clientConnected = false;
 
+const unsigned long WIFI_RETRY_WINDOW_MS = 20000;
+
+void connectWifi()
+{
+    WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_13dBm);
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.print("[ESP32] Connecting to WiFi SSID: ");
+        Serial.println(ssid);
+
+        WiFi.disconnect(true);
+        delay(500);
+        WiFi.begin(ssid, password);
+
+        unsigned long startMs = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_RETRY_WINDOW_MS)
+        {
+            delay(500);
+            Serial.print(".");
+        }
+
+        if (WiFi.status() != WL_CONNECTED)
+        {
+            Serial.print("\n[ESP32] WiFi connect failed, status=");
+            Serial.println(WiFi.status());
+            Serial.println("[ESP32] Retrying. Check SSID/password, 2.4GHz hotspot, and that firmware was re-uploaded.");
+        }
+    }
+
+    Serial.println("\n[ESP32] WiFi connected");
+    Serial.print("[ESP32] IP: ");
+    Serial.println(WiFi.localIP());
+}
+
 // ===== Setup =====
 void setup()
 {
@@ -32,20 +68,7 @@ void setup()
     // PRIZM MUST LOOK AT THIS EXACT BAUDRATE AND CONFIGURATION
     PRIZM.begin(38400, SERIAL_8N1, RXD1, TXD1);
 
-    // Connect WiFi
-    WiFi.begin(ssid, password);
-    WiFi.setTxPower(WIFI_POWER_13dBm); // Set WiFi transmit power to 13dBm (default is 19.5dBm)
-    Serial.print("[ESP32] Connecting to WiFi");
-
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        delay(500);
-        Serial.print(".");
-    }
-
-    Serial.println("\n[ESP32] WiFi connected");
-    Serial.print("[ESP32] IP: ");
-    Serial.println(WiFi.localIP());
+    connectWifi();
 
     server.begin();
     Serial.println("[ESP32] TCP server started on port 81");
