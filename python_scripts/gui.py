@@ -59,10 +59,10 @@ class TelemetryGUI:
     # Robot safety box
     SAFETY_BOX_SIZE_CM = 40.0
     SAFETY_BOX_HALF_CM = SAFETY_BOX_SIZE_CM / 2.0
-    # While drag-repositioning, the cursor must move at least this far from the
-    # press point before the drag direction is treated as a heading; closer than
-    # this and the robot's existing heading is left unchanged.
-    DRAG_AIM_DEADZONE_CM = 6.0
+    # On teleport, the destination must be at least this far from the robot's
+    # current position before its heading is re-aimed toward the destination;
+    # closer than this and the existing heading is left unchanged.
+    TELEPORT_AIM_DEADZONE_CM = 6.0
 
     # ----------------------------
     # Toyota theme palette
@@ -156,12 +156,9 @@ class TelemetryGUI:
         # zooming so the interaction stays smooth.
         self._mouse_down = False
         self._last_interact = 0.0
-        # Drag-and-drop robot repositioning ("place then aim"): the robot being
-        # dragged, the press point that becomes its new position, and the live
-        # cursor point whose direction from the anchor sets the new heading.
-        self._dragging_robot = None
-        self._drag_anchor_xy = None
-        self._drag_cursor_xy = None
+        # Click-to-teleport: first click on a robot arms it (stored here), the
+        # next click on the map teleports it to that point.
+        self._teleport_robot = None
 
         self._build_layout()
         self.root.after(100, self._process_queue)
@@ -415,7 +412,6 @@ class TelemetryGUI:
         self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
         self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
         self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
-        self.canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
 
         toolbar_frame = ttk.Frame(right_panel, style="Card.TFrame")
         toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
@@ -662,43 +658,13 @@ class TelemetryGUI:
     def _on_canvas_release(self, event):
         self._mouse_down = False
         self._last_interact = time.monotonic()
-        if self._dragging_robot is not None:
-            self._finish_robot_drag(event)
 
-    def _on_canvas_motion(self, event):
-        if self._dragging_robot is None:
-            return
-        if event.inaxes != self.ax_traj or event.xdata is None or event.ydata is None:
-            return
-        self._drag_cursor_xy = (event.xdata, event.ydata)
-        self._refresh_plot()
-
-    def _drag_heading_deg(self):
-        """Heading implied by the current drag, or None if the cursor is still
-        within DRAG_AIM_DEADZONE_CM of the anchor (treated as 'no aim')."""
-        if self._drag_anchor_xy is None or self._drag_cursor_xy is None:
-            return None
-        ax, ay = self._drag_anchor_xy
-        cx, cy = self._drag_cursor_xy
-        dx, dy = cx - ax, cy - ay
-        if math.hypot(dx, dy) < self.DRAG_AIM_DEADZONE_CM:
-            return None
-        return math.degrees(math.atan2(dy, dx))
-
-    def _finish_robot_drag(self, event):
-        robot_id = self._dragging_robot
-        anchor = self._drag_anchor_xy
-        heading = self._drag_heading_deg()
-        self._dragging_robot = None
-        self._drag_anchor_xy = None
-        self._drag_cursor_xy = None
-
-        if anchor is None:
-            self._refresh_plot()
-            return
-
-        x = max(0.0, min(self.ARENA_SIZE_CM, anchor[0]))
-        y = max(0.0, min(self.ARENA_SIZE_CM, anchor[1]))
+    def _teleport_robot_to(self, robot_id: str, x_cm: float, y_cm: float) -> None:
+        """Send the armed robot to a clicked point. Heading is set to face the
+        direction of travel (old position -> new point) when the move is large
+        enough; tiny nudges leave the heading unchanged."""
+        x = max(0.0, min(self.ARENA_SIZE_CM, x_cm))
+        y = max(0.0, min(self.ARENA_SIZE_CM, y_cm))
 
         command = {
             "type": "set_pose",
@@ -706,21 +672,28 @@ class TelemetryGUI:
             "x_cm": round(x, 1),
             "y_cm": round(y, 1),
         }
-        if heading is not None:
-            command["theta_deg"] = round(heading, 1)
+
+        heading = None
+        state = self.robot_states.get(robot_id, {})
+        old_x = state.get("x_cm")
+        old_y = state.get("y_cm")
+        if old_x is not None and old_y is not None:
+            dx, dy = x - float(old_x), y - float(old_y)
+            if math.hypot(dx, dy) >= self.TELEPORT_AIM_DEADZONE_CM:
+                heading = math.degrees(math.atan2(dy, dx))
+                command["theta_deg"] = round(heading, 1)
 
         if self.command_sender:
             self.command_sender(command)
 
         if heading is not None:
             self.task_summary_var.set(
-                f"{robot_id} repositioned to ({x:.0f}, {y:.0f}) cm, heading {heading:.0f}°."
+                f"{robot_id} teleported to ({x:.0f}, {y:.0f}) cm, facing {heading:.0f}°."
             )
         else:
             self.task_summary_var.set(
-                f"{robot_id} repositioned to ({x:.0f}, {y:.0f}) cm (heading unchanged)."
+                f"{robot_id} teleported to ({x:.0f}, {y:.0f}) cm (heading unchanged)."
             )
-        self._refresh_plot()
 
     def _user_is_interacting(self) -> bool:
         # True while a drag is in progress or just after a scroll, so the live
@@ -1067,8 +1040,8 @@ class TelemetryGUI:
                 self.task_summary_var.set(f"Goal cell ({row}, {col}) selected.")
 
     def _on_plot_click(self, event):
-        # Ignore clicks while a navigation tool (pan/zoom) is active so dragging
-        # the map doesn't drop goals/obstacles.
+        # Ignore clicks while a navigation tool (pan/zoom) is active so panning
+        # the map doesn't drop goals/obstacles or teleport robots.
         if getattr(self, "toolbar", None) is not None and self.toolbar.mode:
             return
         if event.button != 1:
@@ -1078,14 +1051,25 @@ class TelemetryGUI:
         if not (0.0 <= event.xdata <= self.ARENA_SIZE_CM and 0.0 <= event.ydata <= self.ARENA_SIZE_CM):
             return
 
-        # If the press lands on a robot, begin dragging it instead of dropping a
-        # goal/obstacle. The drop is finalized in _on_canvas_release.
+        # Click-to-teleport, step 2: a robot is armed, so this click is its
+        # destination. Clicking the armed robot again cancels.
+        if self._teleport_robot is not None:
+            armed = self._teleport_robot
+            self._teleport_robot = None
+            if self._robot_near_point(event.xdata, event.ydata) == armed:
+                self.task_summary_var.set(f"Teleport of {armed} cancelled.")
+            else:
+                self._teleport_robot_to(armed, event.xdata, event.ydata)
+            self._refresh_plot()
+            return
+
+        # Click-to-teleport, step 1: clicking a robot arms it for teleport
+        # instead of dropping a goal/obstacle.
         hit = self._robot_near_point(event.xdata, event.ydata)
         if hit is not None:
-            self._dragging_robot = hit
-            self._drag_anchor_xy = (event.xdata, event.ydata)
-            self._drag_cursor_xy = (event.xdata, event.ydata)
-            self.task_summary_var.set(f"Placing {hit}... drag to aim heading, release to commit.")
+            self._teleport_robot = hit
+            self.task_summary_var.set(f"{hit} armed — click a destination to teleport (click it again to cancel).")
+            self._refresh_plot()
             return
 
         col = int(event.xdata // self.GRID_SPACING_CM)
@@ -1188,7 +1172,7 @@ class TelemetryGUI:
         self.fig.set_facecolor(self.C_PANEL)
         self.ax_traj.set_facecolor(self.C_PLOT_BG)
         self.ax_traj.set_title(
-            "Arena Map  ·  click to set priority goal  ·  drag a robot to place + aim",
+            "Arena Map  ·  click to set priority goal  ·  click a robot then a spot to teleport",
             fontsize=12, fontweight="bold", color=self.C_TEXT, pad=10,
         )
         self.ax_traj.set_xlabel("x (cm)", color=self.C_TEXT_DIM)
@@ -1381,25 +1365,17 @@ class TelemetryGUI:
             )
             legend.get_frame().set_facecolor(self.C_PANEL_2)
 
-        # Show a ghost marker at the new position while repositioning, plus an
-        # arrow toward the cursor indicating the heading being aimed.
-        if self._dragging_robot is not None and self._drag_anchor_xy is not None:
-            px, py = self._drag_anchor_xy
-            color = self._get_robot_color(self._dragging_robot)
-            self.ax_traj.scatter(
-                [px], [py], s=160, marker="X", color=color,
-                edgecolors=self.C_TEXT, linewidths=1.2, zorder=10,
-                label=f"{self._dragging_robot} (placing)",
-            )
-            heading = self._drag_heading_deg()
-            if heading is not None:
-                arrow_len = self.SAFETY_BOX_HALF_CM
-                hr = math.radians(heading)
-                self.ax_traj.arrow(
-                    px, py,
-                    arrow_len * math.cos(hr), arrow_len * math.sin(hr),
-                    head_width=6, head_length=8, fc=color, ec=self.C_TEXT,
-                    linewidth=1.0, length_includes_head=True, zorder=11,
+        # Ring the robot that is armed for click-to-teleport.
+        if self._teleport_robot is not None:
+            state = self.robot_states.get(self._teleport_robot, {})
+            rx = state.get("x_cm")
+            ry = state.get("y_cm")
+            if rx is not None and ry is not None:
+                color = self._get_robot_color(self._teleport_robot)
+                self.ax_traj.scatter(
+                    [float(rx)], [float(ry)], s=320, marker="o",
+                    facecolors="none", edgecolors=color, linewidths=2.0,
+                    zorder=10, label=f"{self._teleport_robot} (click to place)",
                 )
 
         # Restore preserved view or snap to the full arena.
