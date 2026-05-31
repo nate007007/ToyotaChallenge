@@ -29,6 +29,9 @@ const int GRIPPER_SERVO_ID = 1;
 const int GRIPPER_OPEN_DEG = 100;
 const int GRIPPER_CLOSED_DEG = 35;
 const int GRIPPER_SERVO_SPEED_PERCENT = 75;
+// Re-assert the servo target for this long after a toggle so a dropped or
+// interrupted I2C write still reaches the controller and the servo settles.
+const unsigned long GRIPPER_SETTLE_MS = 700;
 
 // ==============================
 // Pose state
@@ -64,6 +67,8 @@ bool path_loaded = false;
 bool path_paused = false;
 bool path_started_sent = false;
 bool gripper_closed = false;
+int gripper_target_deg = GRIPPER_OPEN_DEG;
+unsigned long gripper_settle_until_ms = 0;
 
 // Wall-scan state machine (see beginObstacleScan/updateScan).
 bool scanning = false;
@@ -982,17 +987,27 @@ void performStop()
 void performToggleGripper()
 {
     gripper_closed = !gripper_closed;
-    if (gripper_closed)
-    {
-        prizm.setServoPosition(GRIPPER_SERVO_ID, GRIPPER_CLOSED_DEG);
-    }
-    else
-    {
-        prizm.setServoPosition(GRIPPER_SERVO_ID, GRIPPER_OPEN_DEG);
-    }
+    gripper_target_deg = gripper_closed ? GRIPPER_CLOSED_DEG : GRIPPER_OPEN_DEG;
+    prizm.setServoSpeed(GRIPPER_SERVO_ID, GRIPPER_SERVO_SPEED_PERCENT);
+    prizm.setServoPosition(GRIPPER_SERVO_ID, gripper_target_deg);
+    gripper_settle_until_ms = millis() + GRIPPER_SETTLE_MS;
 
     sendAck("toggle_gripper");
     sendStatus(robot_state, gripper_closed ? "gripper_closed" : "gripper_opened");
+}
+
+// Re-assert the latest gripper target for a short window so an I2C write that
+// was dropped or cut short by a busy loop still reaches the servo controller.
+void maybeHoldGripper()
+{
+    if (gripper_settle_until_ms == 0)
+        return;
+    if ((long)(millis() - gripper_settle_until_ms) >= 0)
+    {
+        gripper_settle_until_ms = 0;
+        return;
+    }
+    prizm.setServoPosition(GRIPPER_SERVO_ID, gripper_target_deg);
 }
 
 void handleStop(const char *json)
@@ -1234,7 +1249,9 @@ void setup()
     Serial.begin(115200);  // USB SERIAL
     espSerial.begin(38400); // ESP COMMUNICATION SERIAL (ESP NEEDS TO LOOK AT THE SAME BAUDRATE)
     prizm.setServoSpeed(GRIPPER_SERVO_ID, GRIPPER_SERVO_SPEED_PERCENT);
-    prizm.setServoPosition(GRIPPER_SERVO_ID, GRIPPER_OPEN_DEG);
+    gripper_closed = false;
+    gripper_target_deg = GRIPPER_OPEN_DEG;
+    prizm.setServoPosition(GRIPPER_SERVO_ID, gripper_target_deg);
 
     delay(1500);
 
@@ -1265,6 +1282,9 @@ void loop()
     // 5. Refresh sensors only when the serial input is quiet
     maybeUpdateSensors();
 
-    // 6. Periodic telemetry
+    // 6. Keep re-asserting a recent gripper command until the servo settles
+    maybeHoldGripper();
+
+    // 7. Periodic telemetry
     maybeSendTelemetry();
 }
