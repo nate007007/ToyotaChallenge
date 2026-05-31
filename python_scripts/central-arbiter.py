@@ -33,12 +33,15 @@ OBSTACLE_MEMORY_S = 20.0
 MAX_WAYPOINTS_PER_ASSIGNMENT = 8
 MIN_OBSTACLE_SENSOR_CM = 2.0
 MAX_OBSTACLE_SENSOR_CM = 120.0
-# The robot body is wider than one 10 cm cell, so the planner keeps this many
-# cells of clearance around every obstacle. Without it the BFS routes the
-# robot's center one cell off a wall, the body clips the wall, and the robot
-# re-scans the same spot forever. Inflation also merges the sparse per-ray
-# obstacle dots from a wall scan into one continuous barrier.
-OBSTACLE_INFLATE_CELLS = 1
+# The robot body is wider than one 10 cm cell (forward sensors sit ~14 cm apart
+# and the chassis is wider still), so the planner inflates obstacles to keep the
+# whole body clear. With radius 1 the path center stays only 10 cm from a wall
+# cell center -- ~5 cm from the wall edge -- and the body clips it, so the robot
+# appears to drive through walls. Permanent walls are known hazards and get the
+# full body clearance (radius 2 ~= 20 cm). Transient sensor blips are noisy and
+# numerous, so they get a lighter radius 1 to avoid walling off the whole arena.
+PERMANENT_INFLATE_CELLS = 2
+TRANSIENT_INFLATE_CELLS = 1
 # A robot with an active goal is never abandoned: the watchdog keeps replanning
 # at this cadence until it arrives or the operator presses Stop.
 REPLAN_WATCHDOG_PERIOD_S = 2.0
@@ -612,15 +615,12 @@ def replan_robot_to_goal(robot_id: str) -> bool:
 
 def inflate_blocked(
     blocked: set[tuple[int, int]],
-    keep_clear: set[tuple[int, int]],
+    radius: int,
 ) -> set[tuple[int, int]]:
-    """Grow every blocked cell by OBSTACLE_INFLATE_CELLS so the planned path
-    keeps the robot's body clear of walls. Cells in keep_clear (the start and
-    goal) are always left traversable so the robot can leave a tight spot and
-    reach a goal that sits next to an obstacle."""
-    if OBSTACLE_INFLATE_CELLS <= 0:
+    """Grow every blocked cell by `radius` cells so the planned path keeps the
+    robot's body clear of obstacles."""
+    if radius <= 0:
         return set(blocked)
-    radius = OBSTACLE_INFLATE_CELLS
     inflated: set[tuple[int, int]] = set()
     for row, col in blocked:
         for d_row in range(-radius, radius + 1):
@@ -628,8 +628,27 @@ def inflate_blocked(
                 cell = (row + d_row, col + d_col)
                 if 0 <= cell[0] < GRID_DIM_CELLS and 0 <= cell[1] < GRID_DIM_CELLS:
                     inflated.add(cell)
-    inflated -= keep_clear
     return inflated
+
+
+def build_blocked_cells(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    front_block: set[tuple[int, int]],
+    drop_transient: bool,
+) -> set[tuple[int, int]]:
+    """Assemble the obstacle set the BFS plans against. Permanent walls (and the
+    wall the robot is currently nosed against) get full body clearance; transient
+    sensor obstacles get a lighter touch and can be dropped entirely if they have
+    boxed the robot in. Start and goal are always left traversable."""
+    permanent = set(permanent_obstacle_cells) | set(front_block)
+    blocked = inflate_blocked(permanent, PERMANENT_INFLATE_CELLS)
+    if not drop_transient:
+        transient = set(obstacle_cells_snapshot()) - set(permanent_obstacle_cells)
+        blocked |= inflate_blocked(transient, TRANSIENT_INFLATE_CELLS)
+    blocked.discard(start)
+    blocked.discard(goal)
+    return blocked
 
 
 def plan_grid_path(
@@ -637,10 +656,10 @@ def plan_grid_path(
     goal: tuple[int, int],
     blocked: set[tuple[int, int]],
 ) -> list[tuple[int, int]] | None:
+    # NOTE: `blocked` must already be inflated by the caller (see
+    # build_blocked_cells / plan_route_keep_permanent). This is pure BFS.
     if start == goal:
         return [start]
-
-    blocked = inflate_blocked(blocked, {start, goal})
 
     queue = deque([start])
     came_from = {start: None}
@@ -703,13 +722,9 @@ def plan_route_keep_permanent(
     if no route avoids the permanent obstacles, in which case the caller should
     hold and let the watchdog retry rather than crash through a known wall."""
     front_block = set(front_block) if front_block else set()
-    full = obstacle_cells_snapshot() | front_block
-    permanent = set(permanent_obstacle_cells) | front_block
-    for blocked in (full, permanent):
-        attempt = set(blocked)
-        attempt.discard(start)
-        attempt.discard(goal)
-        path = plan_grid_path(start, goal, attempt)
+    for drop_transient in (False, True):
+        blocked = build_blocked_cells(start, goal, front_block, drop_transient)
+        path = plan_grid_path(start, goal, blocked)
         if path is not None:
             return path
     return None
@@ -760,18 +775,22 @@ def start_coordinated_traverse(message: dict) -> bool:
         print("[COORD] Robots cannot share the same goal cell")
         return False
 
-    dynamic_blocked = obstacle_cells_snapshot()
-    dynamic_blocked.discard(start_one)
-    dynamic_blocked.discard(start_two)
-    dynamic_blocked.discard(goal_one)
-    dynamic_blocked.discard(goal_two)
+    blocked_one = build_blocked_cells(start_one, goal_one, set(), drop_transient=False)
+    blocked_one |= inflate_blocked({start_two}, TRANSIENT_INFLATE_CELLS)
+    blocked_one.discard(start_one)
+    blocked_one.discard(goal_one)
 
-    path_one = plan_grid_path(start_one, goal_one, dynamic_blocked | {start_two})
+    path_one = plan_grid_path(start_one, goal_one, blocked_one)
     if path_one is None:
         print(f"[COORD] No path found for {robot_one_id} from {start_one} to {goal_one}")
         return False
 
-    path_two = plan_grid_path(start_two, goal_two, dynamic_blocked | {goal_one})
+    blocked_two = build_blocked_cells(start_two, goal_two, set(), drop_transient=False)
+    blocked_two |= inflate_blocked({goal_one}, TRANSIENT_INFLATE_CELLS)
+    blocked_two.discard(start_two)
+    blocked_two.discard(goal_two)
+
+    path_two = plan_grid_path(start_two, goal_two, blocked_two)
     if path_two is None:
         print(f"[COORD] No path found for {robot_two_id} from {start_two} to {goal_two}")
         return False
