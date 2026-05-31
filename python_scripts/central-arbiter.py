@@ -24,6 +24,10 @@ GRID_CELL_CM = 10.0
 GRID_DIM_CELLS = 40
 ARENA_SIZE_CM = GRID_CELL_CM * GRID_DIM_CELLS
 OBSTACLE_MEMORY_S = 20.0
+# Firmware accepts up to MAX_WAYPOINTS (12) per path_assignment. Sending a full
+# batch instead of one cell at a time avoids a serial round-trip per 10 cm,
+# which is the main source of click-to-motion latency.
+MAX_WAYPOINTS_PER_ASSIGNMENT = 12
 MIN_OBSTACLE_SENSOR_CM = 2.0
 MAX_OBSTACLE_SENSOR_CM = 120.0
 PERMANENT_OBSTACLES_PATH = Path(__file__).with_name("permanent_obstacles.json")
@@ -267,14 +271,15 @@ def dispatch_next_waypoint(robot_id: str) -> bool:
             session.active_subpath_id = None
             return False
 
-        waypoint = session.pending_waypoints.pop(0)
+        batch = session.pending_waypoints[:MAX_WAYPOINTS_PER_ASSIGNMENT]
+        del session.pending_waypoints[:MAX_WAYPOINTS_PER_ASSIGNMENT]
         subpath_id = next_subpath_id()
         message = {
             "type": "path_assignment",
             "robot_id": robot_id,
             "path_id": subpath_id,
             "replace_existing": True,
-            "waypoints": [waypoint],
+            "waypoints": batch,
         }
         if session.pending_motion is not None:
             message["motion"] = dict(session.pending_motion)
@@ -291,13 +296,13 @@ def dispatch_next_waypoint(robot_id: str) -> bool:
             client_id = robots_by_id.get(robot_id)
             session = client_sessions.get(client_id) if client_id is not None else None
             if session is not None:
-                session.pending_waypoints.insert(0, waypoint)
+                session.pending_waypoints[:0] = batch
                 session.active_subpath_id = None
                 session.awaiting_path_ack = False
                 session.awaiting_path_complete = False
         return False
 
-    print(f"[SEQUENCE] dispatched subpath {subpath_id} to {robot_id} -> {waypoint}")
+    print(f"[SEQUENCE] dispatched subpath {subpath_id} to {robot_id} -> {len(batch)} waypoints")
     return True
 
 
@@ -344,6 +349,21 @@ def remember_obstacle_cell(cell: tuple[int, int] | None) -> None:
         obstacle_cells[cell] = time.time()
 
 
+def front_cell_from_pose(telemetry: dict, lookahead_cm: float = 15.0) -> tuple[int, int] | None:
+    """The grid cell directly ahead of the robot, used to block the wall it
+    just bumped into so the planner is forced to route around it."""
+    try:
+        x = float(telemetry["x_cm"])
+        y = float(telemetry["y_cm"])
+        theta_rad = math.radians(float(telemetry["theta_deg"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    fx = x + lookahead_cm * math.cos(theta_rad)
+    fy = y + lookahead_cm * math.sin(theta_rad)
+    return cm_to_cell(fx, fy)
+
+
 def obstacle_cells_snapshot() -> set[tuple[int, int]]:
     prune_obstacle_cells()
     return set(obstacle_cells) | set(permanent_obstacle_cells)
@@ -386,11 +406,13 @@ def add_sensor_obstacles_from_telemetry(telemetry: dict) -> None:
     except (KeyError, TypeError, ValueError):
         return
 
+    # Forward ultrasonics sit 5.5 in (~14 cm) apart, so +/-7.0 cm off center.
+    # Side IR (disabled in firmware) sit at the robot edges, ~15 cm off center.
     sensors = (
-        ("left_ultrasonic_cm", 9.5, 16.0, 0.0),
-        ("right_ultrasonic_cm", 9.5, -16.0, 0.0),
-        ("left_ir_cm", 0.0, 16.0, 90.0),
-        ("right_ir_cm", 0.0, -16.0, -90.0),
+        ("left_ultrasonic_cm", 9.5, 7.0, 0.0),
+        ("right_ultrasonic_cm", 9.5, -7.0, 0.0),
+        ("left_ir_cm", 0.0, 15.0, 90.0),
+        ("right_ir_cm", 0.0, -15.0, -90.0),
     )
 
     theta_rad = math.radians(theta_deg)
@@ -482,19 +504,29 @@ def replan_robot_to_goal(robot_id: str) -> bool:
             print(f"[REPLAN] No connected session for robot_id={robot_id}")
             return False
 
-        start = pose_to_cell(session.last_telemetry or {})
+        telemetry = session.last_telemetry or {}
+        start = pose_to_cell(telemetry)
         motion = dict(session.pending_motion) if isinstance(session.pending_motion, dict) else None
 
     if start is None:
         print(f"[REPLAN] Need telemetry before replanning robot_id={robot_id}")
         return False
 
+    # The robot stopped because a wall is directly ahead. Block that cell so
+    # the planner is forced to find a different route instead of re-deriving
+    # the same straight line back into the wall.
+    front_cell = front_cell_from_pose(telemetry)
+    if front_cell is not None:
+        remember_obstacle_cell(front_cell)
+
     blocked = obstacle_cells_snapshot()
     blocked.discard(start)
     blocked.discard(goal)
+    if front_cell is not None and front_cell != goal:
+        blocked.add(front_cell)
     path = plan_grid_path(start, goal, blocked)
     if path is None:
-        print(f"[REPLAN] No path robot_id={robot_id} start={start} goal={goal} blocked={len(blocked)}")
+        print(f"[REPLAN] No path robot_id={robot_id} start={start} goal={goal} blocked={len(blocked)} front={front_cell}")
         return False
 
     waypoints = [cell_center_waypoint(cell) for cell in path[1:]]
@@ -517,7 +549,7 @@ def replan_robot_to_goal(robot_id: str) -> bool:
 
     print(
         f"[REPLAN] robot_id={robot_id} start={start} goal={goal} "
-        f"waypoints={len(waypoints)} blocked={len(blocked)}"
+        f"front_blocked={front_cell} waypoints={len(waypoints)} blocked={len(blocked)}"
     )
     maybe_dispatch_waiting_sequences()
     return True
