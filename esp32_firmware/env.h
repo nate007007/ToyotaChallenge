@@ -1,2 +1,2 @@
-#define ssid "NathanPhone"
-#define password "nate1234"
+#define ssid "UW-Lab"
+#define password "LeZPjTCXW89hufgX"
