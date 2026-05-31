@@ -102,7 +102,10 @@ bool serialLineOverflow = false;
 unsigned long lastTelemetrySendMs = 0;
 const unsigned long TELEMETRY_PERIOD_MS = 250;
 unsigned long lastSensorReadMs = 0;
-const unsigned long SENSOR_READ_PERIOD_MS = 80;
+// Read the forward ultrasonics at 25 Hz. With OBSTACLE_CONFIRM_SAMPLES=2 this
+// puts the worst-case time from an obstacle appearing to the wheels stopping at
+// ~80 ms (was ~160 ms at 80 ms/sample), so the robot reacts before it hits.
+const unsigned long SENSOR_READ_PERIOD_MS = 40;
 const unsigned long CLAW_SENSOR_READ_PERIOD_MS = 500;
 const unsigned long SONIC_TIMEOUT_US = 8000;
 // Obstacle confirmation: a forward sensor must read within its clearance for
@@ -123,9 +126,9 @@ const int LEFT_FORWARD_ULTRASONIC_PIN = 5;
 // Stop clearances measured at the two forward ultrasonics, in cm.
 // Each side has its own target gap, and the gap shrinks when the claw is
 // closed (the claw extends the robot's reach, so it can approach closer).
-const float LEFT_STOP_CLAW_OPEN_CM = 15.5;
+const float LEFT_STOP_CLAW_OPEN_CM = 18.5;
 const float LEFT_STOP_CLAW_CLOSED_CM = 13.0;
-const float RIGHT_STOP_CLAW_OPEN_CM = 12.5;
+const float RIGHT_STOP_CLAW_OPEN_CM = 15.5;
 const float RIGHT_STOP_CLAW_CLOSED_CM = 10.0;
 const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
 // Wall-scan sweep: on hitting a wall mid-path, the robot pivots from
