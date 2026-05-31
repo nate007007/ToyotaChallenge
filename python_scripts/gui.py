@@ -148,6 +148,10 @@ class TelemetryGUI:
         # Arena view state: preserve user pan/zoom across live redraws.
         self._plot_initialized = False
         self._reset_view = False
+        # Suppress the heavy 10 Hz rebuild while the user is actively panning or
+        # zooming so the interaction stays smooth.
+        self._mouse_down = False
+        self._last_interact = 0.0
 
         self._build_layout()
         self.root.after(100, self._process_queue)
@@ -399,6 +403,8 @@ class TelemetryGUI:
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
         self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_press)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
 
         toolbar_frame = ttk.Frame(right_panel, style="Card.TFrame")
         toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
@@ -638,10 +644,26 @@ class TelemetryGUI:
         self._reset_view = True
         self._refresh_plot()
 
+    def _on_canvas_press(self, event):
+        self._mouse_down = True
+        self._last_interact = time.monotonic()
+
+    def _on_canvas_release(self, event):
+        self._mouse_down = False
+        self._last_interact = time.monotonic()
+
+    def _user_is_interacting(self) -> bool:
+        # True while a drag is in progress or just after a scroll, so the live
+        # loop can skip the expensive axes rebuild and let pan/zoom stay fluid.
+        if self._mouse_down:
+            return True
+        return (time.monotonic() - self._last_interact) < 0.35
+
     def _on_scroll_zoom(self, event):
         if event.inaxes != self.ax_traj or event.xdata is None or event.ydata is None:
             return
-        base = 1.2
+        # Finer step than the default so repeated scrolling feels gradual.
+        base = 1.1
         scale = (1.0 / base) if event.button == "up" else base
 
         x0, x1 = self.ax_traj.get_xlim()
@@ -653,6 +675,7 @@ class TelemetryGUI:
 
         self.ax_traj.set_xlim(event.xdata - new_w * relx, event.xdata + new_w * (1 - relx))
         self.ax_traj.set_ylim(event.ydata - new_h * rely, event.ydata + new_h * (1 - rely))
+        self._last_interact = time.monotonic()
         self.canvas.draw_idle()
 
     def _get_robot_color(self, robot_id: str) -> str:
@@ -819,7 +842,10 @@ class TelemetryGUI:
         if updated:
             self._refresh_table()
             self._refresh_robot_selector()
-            self._refresh_plot()
+            # Skip the heavy axes rebuild while the user is panning/zooming; it
+            # would stutter their interaction. We catch up on the next tick.
+            if not self._user_is_interacting():
+                self._refresh_plot()
 
         self.root.after(100, self._process_queue)
 
@@ -1266,7 +1292,7 @@ class TelemetryGUI:
             self.ax_traj.set_xlim(0, self.ARENA_SIZE_CM)
             self.ax_traj.set_ylim(0, self.ARENA_SIZE_CM)
 
-        self.canvas.draw()
+        self.canvas.draw_idle()
     
     # ----------------------------
     # Control Board

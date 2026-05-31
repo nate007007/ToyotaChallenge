@@ -30,6 +30,12 @@ OBSTACLE_MEMORY_S = 20.0
 MAX_WAYPOINTS_PER_ASSIGNMENT = 12
 MIN_OBSTACLE_SENSOR_CM = 2.0
 MAX_OBSTACLE_SENSOR_CM = 120.0
+# A robot with an active goal is never abandoned: the watchdog keeps replanning
+# at this cadence until it arrives or the operator presses Stop.
+REPLAN_WATCHDOG_PERIOD_S = 2.0
+# If a dispatch has been waiting this long for path_complete with no progress,
+# assume the message/round-trip was lost and recover so the robot isn't wedged.
+DISPATCH_STALL_TIMEOUT_S = 8.0
 PERMANENT_OBSTACLES_PATH = Path(__file__).with_name("permanent_obstacles.json")
 
 
@@ -53,6 +59,7 @@ class ClientSession:
     active_subpath_id: Optional[int] = None
     awaiting_path_ack: bool = False
     awaiting_path_complete: bool = False
+    awaiting_since: float = 0.0
 
 
 clients_lock = threading.Lock()
@@ -221,6 +228,28 @@ def clear_robot_sequence(session: ClientSession) -> None:
     session.active_subpath_id = None
     session.awaiting_path_ack = False
     session.awaiting_path_complete = False
+    session.awaiting_since = 0.0
+
+
+def recover_dispatch_flags(robot_id: str, state: str | None = None) -> None:
+    """Release the awaiting-path flags so a robot is never permanently wedged
+    when a path_complete is lost or a replan can't find a route yet."""
+    with clients_lock:
+        client_id = robots_by_id.get(robot_id)
+        session = client_sessions.get(client_id) if client_id is not None else None
+        if session is None:
+            return
+        session.awaiting_path_ack = False
+        session.awaiting_path_complete = False
+        session.awaiting_since = 0.0
+        session.active_subpath_id = None
+        if state is not None:
+            session.state = state
+
+
+def clear_active_goal(robot_id: str) -> None:
+    """Forget a robot's goal so the watchdog stops chasing it (arrival or Stop)."""
+    goal_by_robot.pop(robot_id, None)
 
 
 def any_other_robot_busy_unlocked(robot_id: str) -> bool:
@@ -289,6 +318,7 @@ def dispatch_next_waypoint(robot_id: str) -> bool:
         session.current_waypoint_index = 0
         session.awaiting_path_ack = True
         session.awaiting_path_complete = True
+        session.awaiting_since = time.time()
 
     ok = send_to_robot(robot_id, message)
     if not ok:
@@ -512,26 +542,50 @@ def replan_robot_to_goal(robot_id: str) -> bool:
         print(f"[REPLAN] Need telemetry before replanning robot_id={robot_id}")
         return False
 
+    if start == goal:
+        print(f"[REPLAN] robot_id={robot_id} already at goal={goal}")
+        clear_active_goal(robot_id)
+        return False
+
     # The robot stopped because a wall is directly ahead. Block that cell so
     # the planner is forced to find a different route instead of re-deriving
-    # the same straight line back into the wall.
+    # the same straight line back into the wall. The front cell stays blocked
+    # in every attempt below; only the *other* remembered obstacles are relaxed.
     front_cell = front_cell_from_pose(telemetry)
     if front_cell is not None:
         remember_obstacle_cell(front_cell)
+    front_block = {front_cell} if (front_cell is not None and front_cell != goal) else set()
 
-    blocked = obstacle_cells_snapshot()
-    blocked.discard(start)
-    blocked.discard(goal)
-    if front_cell is not None and front_cell != goal:
-        blocked.add(front_cell)
-    path = plan_grid_path(start, goal, blocked)
+    # Try progressively looser obstacle sets so we keep finding a route instead
+    # of giving up: (1) everything we know, (2) only permanent obstacles in case
+    # transient sensor noise walled the robot in, (3) just the cell ahead.
+    full = obstacle_cells_snapshot() | front_block
+    permanent_only = set(permanent_obstacle_cells) | front_block
+    front_only = set(front_block)
+
+    path = None
+    for label, blocked in (("full", full), ("permanent", permanent_only), ("front", front_only)):
+        attempt = set(blocked)
+        attempt.discard(start)
+        attempt.discard(goal)
+        path = plan_grid_path(start, goal, attempt)
+        if path is not None:
+            if label != "full":
+                print(f"[REPLAN] robot_id={robot_id} routed with relaxed obstacles ({label})")
+            break
+
     if path is None:
-        print(f"[REPLAN] No path robot_id={robot_id} start={start} goal={goal} blocked={len(blocked)} front={front_cell}")
+        # Boxed in even ignoring sensor obstacles. Do NOT wedge the robot:
+        # recover its flags so the watchdog keeps retrying, and let the firmware
+        # back up + rescan on the next attempt as obstacle memory expires.
+        print(f"[REPLAN] No path yet robot_id={robot_id} start={start} goal={goal} front={front_cell}; will keep retrying")
+        recover_dispatch_flags(robot_id, state="needs_replan")
         return False
 
     waypoints = [cell_center_waypoint(cell) for cell in path[1:]]
     if not waypoints:
         print(f"[REPLAN] robot_id={robot_id} already at goal={goal}")
+        clear_active_goal(robot_id)
         return False
 
     with clients_lock:
@@ -779,6 +833,9 @@ def gui_command_sender(message_obj):
             ok = queue_robot_path(message)
         else:
             if message.get("type") in {"stop", "continuous_drive"}:
+                # Operator override cancels the autonomous goal so the watchdog
+                # stops trying to drive the old route.
+                clear_active_goal(robot_id)
                 with clients_lock:
                     client_id = robots_by_id.get(robot_id)
                     session = client_sessions.get(client_id) if client_id is not None else None
@@ -944,7 +1001,12 @@ def handle_path_event(client_id: int, msg: dict) -> None:
 
     if msg.get("type") == "path_complete":
         if session.robot_id:
-            dispatch_next_waypoint(session.robot_id)
+            # If more batches remain, send the next one; otherwise the whole
+            # route is done, so the robot has reached its goal -> forget it.
+            if session.pending_waypoints:
+                dispatch_next_waypoint(session.robot_id)
+            else:
+                clear_active_goal(session.robot_id)
         maybe_dispatch_waiting_sequences()
 
 
@@ -1039,6 +1101,7 @@ def handle_client(client_id: int, conn: socket.socket, addr) -> None:
                 mapped_client_id = robots_by_id.get(session.robot_id)
                 if mapped_client_id == client_id:
                     robots_by_id.pop(session.robot_id, None)
+                    goal_by_robot.pop(session.robot_id, None)
 
         conn.close()
         print(f"[-] Client {client_id} disconnected")
@@ -1082,6 +1145,50 @@ def accept_loop(server_sock: socket.socket) -> None:
 
 
 # ----------------------------
+# Replan watchdog
+# ----------------------------
+def tick_replan_watchdog() -> None:
+    """Keep every robot that has an active goal moving toward it. A goal is only
+    forgotten on arrival or when the operator presses Stop, so the fleet never
+    silently gives up on a dispatch."""
+    now = time.time()
+    actions: list[tuple[str, str]] = []
+    with clients_lock:
+        for robot_id in list(goal_by_robot.keys()):
+            client_id = robots_by_id.get(robot_id)
+            session = client_sessions.get(client_id) if client_id is not None else None
+            if session is None:
+                continue
+            if session.awaiting_path_complete:
+                stalled = session.awaiting_since and (now - session.awaiting_since) > DISPATCH_STALL_TIMEOUT_S
+                if stalled:
+                    actions.append((robot_id, "recover"))
+                continue
+            if session.pending_waypoints:
+                actions.append((robot_id, "dispatch"))
+            else:
+                actions.append((robot_id, "replan"))
+
+    for robot_id, action in actions:
+        if action == "recover":
+            print(f"[WATCHDOG] dispatch stalled for {robot_id}; recovering and retrying")
+            recover_dispatch_flags(robot_id, state="needs_replan")
+        elif action == "dispatch":
+            dispatch_next_waypoint(robot_id)
+        elif action == "replan":
+            replan_robot_to_goal(robot_id)
+
+
+def replan_watchdog_loop() -> None:
+    while True:
+        time.sleep(REPLAN_WATCHDOG_PERIOD_S)
+        try:
+            tick_replan_watchdog()
+        except Exception as exc:
+            print(f"[WATCHDOG] error: {exc}")
+
+
+# ----------------------------
 # Server main
 # ----------------------------
 def server_main() -> None:
@@ -1097,6 +1204,9 @@ def server_main() -> None:
 def main() -> None:
     server_thread = threading.Thread(target=server_main, daemon=True)
     server_thread.start()
+
+    watchdog_thread = threading.Thread(target=replan_watchdog_loop, daemon=True)
+    watchdog_thread.start()
 
     gui.run()
 
