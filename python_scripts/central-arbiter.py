@@ -493,20 +493,26 @@ def dispatch_priority_task(goal_row: int, goal_col: int, priority: int = 1) -> t
 
     robot = snapshot[robot_id]
     start = pose_to_cell(robot.get("last_telemetry") or {})
-    blocked = obstacle_cells_snapshot()
-    if start is not None:
-        blocked.discard(start)
-    blocked.discard(goal)
-    path = plan_grid_path(start, goal, blocked) if start is not None else None
+    # Remember the goal up front so the watchdog keeps retrying if we can't find
+    # a route right now -- the robot is never abandoned, but it also never gets
+    # a blind straight line driven through a known obstacle.
+    goal_by_robot[robot_id] = goal
+    path = plan_route_keep_permanent(start, goal) if start is not None else None
     fallback_reason = ""
     if start is None:
+        # No telemetry means no obstacle frame of reference; head for the goal
+        # and let the firmware's reactive scan handle anything in the way.
         fallback_reason = "no_start_telemetry_fallback_direct_goal"
         waypoints = [cell_center_waypoint(goal)]
     elif path is None:
-        fallback_reason = "no_path_fallback_direct_goal"
-        waypoints = [cell_center_waypoint(goal)]
+        # Boxed in by permanent obstacles for now. Hold rather than crash
+        # through; the watchdog replans every couple seconds as the robot
+        # backs up / rescans and transient obstacle memory expires.
+        print(f"[TASK {task_id}] no route to {goal} yet for {robot_id}; watchdog will retry")
+        task_db.update_task(task_id, "assigned", robot_id=robot_id)
+        return True, "no_path_will_retry"
     else:
-        waypoints = [cell_center_waypoint(cell) for cell in path[1:]]
+        waypoints = [cell_center_waypoint(cell) for cell in simplify_path(path)[1:]]
     if not waypoints:
         waypoints = [cell_center_waypoint(goal)]
 
@@ -522,7 +528,7 @@ def dispatch_priority_task(goal_row: int, goal_col: int, priority: int = 1) -> t
     task_db.update_task(task_id, "dispatched" if ok else "failed", robot_id=robot_id)
     print(
         f"[TASK {task_id}] priority dispatch robot={robot_id} "
-        f"goal={goal} waypoints={len(waypoints)} blocked={len(blocked)} ok={ok} "
+        f"goal={goal} waypoints={len(waypoints)} ok={ok} "
         f"fallback={fallback_reason!r}"
     )
     if ok:
@@ -565,23 +571,9 @@ def replan_robot_to_goal(robot_id: str) -> bool:
         remember_obstacle_cell(front_cell)
     front_block = {front_cell} if (front_cell is not None and front_cell != goal) else set()
 
-    # Try progressively looser obstacle sets so we keep finding a route instead
-    # of giving up: (1) everything we know, (2) only permanent obstacles in case
-    # transient sensor noise walled the robot in, (3) just the cell ahead.
-    full = obstacle_cells_snapshot() | front_block
-    permanent_only = set(permanent_obstacle_cells) | front_block
-    front_only = set(front_block)
-
-    path = None
-    for label, blocked in (("full", full), ("permanent", permanent_only), ("front", front_only)):
-        attempt = set(blocked)
-        attempt.discard(start)
-        attempt.discard(goal)
-        path = plan_grid_path(start, goal, attempt)
-        if path is not None:
-            if label != "full":
-                print(f"[REPLAN] robot_id={robot_id} routed with relaxed obstacles ({label})")
-            break
+    # Relax only transient sensor obstacles if needed, but NEVER drop permanent
+    # obstacles -- driving through a known fixed hazard is worse than waiting.
+    path = plan_route_keep_permanent(start, goal, front_block)
 
     if path is None:
         # Boxed in even ignoring sensor obstacles. Do NOT wedge the robot:
@@ -591,7 +583,7 @@ def replan_robot_to_goal(robot_id: str) -> bool:
         recover_dispatch_flags(robot_id, state="needs_replan")
         return False
 
-    waypoints = [cell_center_waypoint(cell) for cell in path[1:]]
+    waypoints = [cell_center_waypoint(cell) for cell in simplify_path(path)[1:]]
     if not waypoints:
         print(f"[REPLAN] robot_id={robot_id} already at goal={goal}")
         clear_active_goal(robot_id)
@@ -612,7 +604,7 @@ def replan_robot_to_goal(robot_id: str) -> bool:
 
     print(
         f"[REPLAN] robot_id={robot_id} start={start} goal={goal} "
-        f"front_blocked={front_cell} waypoints={len(waypoints)} blocked={len(blocked)}"
+        f"front_blocked={front_cell} waypoints={len(waypoints)}"
     )
     maybe_dispatch_waiting_sequences()
     return True
@@ -677,6 +669,49 @@ def plan_grid_path(
 
             queue.append(next_cell)
 
+    return None
+
+
+def simplify_path(path: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Drop intermediate cells on a straight run, keeping only the start, the
+    corners where the direction changes, and the goal. The robot then drives
+    each straight leg in one motion instead of stopping every 10 cm at every
+    grid cell, which is what made motion 'go a bit and stop a lot'."""
+    if len(path) <= 2:
+        return list(path)
+    simplified = [path[0]]
+    for i in range(1, len(path) - 1):
+        prev_row, prev_col = path[i - 1]
+        cur_row, cur_col = path[i]
+        next_row, next_col = path[i + 1]
+        in_dir = (cur_row - prev_row, cur_col - prev_col)
+        out_dir = (next_row - cur_row, next_col - cur_col)
+        if in_dir != out_dir:
+            simplified.append(path[i])
+    simplified.append(path[-1])
+    return simplified
+
+
+def plan_route_keep_permanent(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    front_block: set[tuple[int, int]] | None = None,
+) -> list[tuple[int, int]] | None:
+    """Plan a route that ALWAYS respects permanent obstacles. We relax only the
+    transient (sensor) obstacles if the full set boxes the robot in -- permanent
+    obstacles are fixed hazards and must never be driven through. Returns None
+    if no route avoids the permanent obstacles, in which case the caller should
+    hold and let the watchdog retry rather than crash through a known wall."""
+    front_block = set(front_block) if front_block else set()
+    full = obstacle_cells_snapshot() | front_block
+    permanent = set(permanent_obstacle_cells) | front_block
+    for blocked in (full, permanent):
+        attempt = set(blocked)
+        attempt.discard(start)
+        attempt.discard(goal)
+        path = plan_grid_path(start, goal, attempt)
+        if path is not None:
+            return path
     return None
 
 

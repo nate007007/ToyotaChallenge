@@ -130,10 +130,11 @@ const float RIGHT_STOP_CLAW_CLOSED_CM = 10.0;
 const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
 // Wall-scan sweep: on hitting a wall mid-path, the robot pivots from
 // -HALF_SWEEP to +HALF_SWEEP, pausing to take SCAN_SAMPLES readings.
-// A wider cone with more samples lets the arbiter see where the wall actually
-// ends and find the opening, instead of only reading a narrow patch dead ahead.
+// Sweep a 90 deg cone (+/-45) so the arbiter can see where the wall ends, but
+// take only 3 samples (left, center, right) so the scan turns smoothly instead
+// of stop-starting through many tiny steps.
 const float SCAN_HALF_SWEEP_DEG = 45.0;
-const int SCAN_SAMPLES = 7;
+const int SCAN_SAMPLES = 3;
 const float SCAN_STEP_DEG = (2.0 * SCAN_HALF_SWEEP_DEG) / (SCAN_SAMPLES - 1);
 // If we stop this close to a wall, reverse a little first so there is room to
 // pivot and re-approach at an angle instead of grinding nose-against-wall.
