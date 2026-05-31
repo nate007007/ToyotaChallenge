@@ -24,10 +24,13 @@ GRID_CELL_CM = 10.0
 GRID_DIM_CELLS = 40
 ARENA_SIZE_CM = GRID_CELL_CM * GRID_DIM_CELLS
 OBSTACLE_MEMORY_S = 20.0
-# Firmware accepts up to MAX_WAYPOINTS (12) per path_assignment. Sending a full
-# batch instead of one cell at a time avoids a serial round-trip per 10 cm,
-# which is the main source of click-to-motion latency.
-MAX_WAYPOINTS_PER_ASSIGNMENT = 12
+# Firmware accepts up to MAX_WAYPOINTS (12), but its serial line buffer is only
+# 512 bytes (ATmega328P SRAM is tight). A 12-waypoint message with a motion
+# block is ~528 bytes and gets dropped; 8 waypoints is ~402 bytes, leaving
+# comfortable headroom. Batching still avoids a serial round-trip per 10 cm,
+# which was the main source of click-to-motion latency; the rest of the path
+# flows on each path_complete.
+MAX_WAYPOINTS_PER_ASSIGNMENT = 8
 MIN_OBSTACLE_SENSOR_CM = 2.0
 MAX_OBSTACLE_SENSOR_CM = 120.0
 # The robot body is wider than one 10 cm cell, so the planner keeps this many
