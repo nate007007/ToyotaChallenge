@@ -30,6 +30,12 @@ OBSTACLE_MEMORY_S = 20.0
 MAX_WAYPOINTS_PER_ASSIGNMENT = 12
 MIN_OBSTACLE_SENSOR_CM = 2.0
 MAX_OBSTACLE_SENSOR_CM = 120.0
+# The robot body is wider than one 10 cm cell, so the planner keeps this many
+# cells of clearance around every obstacle. Without it the BFS routes the
+# robot's center one cell off a wall, the body clips the wall, and the robot
+# re-scans the same spot forever. Inflation also merges the sparse per-ray
+# obstacle dots from a wall scan into one continuous barrier.
+OBSTACLE_INFLATE_CELLS = 1
 # A robot with an active goal is never abandoned: the watchdog keeps replanning
 # at this cadence until it arrives or the operator presses Stop.
 REPLAN_WATCHDOG_PERIOD_S = 2.0
@@ -609,6 +615,28 @@ def replan_robot_to_goal(robot_id: str) -> bool:
     return True
 
 
+def inflate_blocked(
+    blocked: set[tuple[int, int]],
+    keep_clear: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Grow every blocked cell by OBSTACLE_INFLATE_CELLS so the planned path
+    keeps the robot's body clear of walls. Cells in keep_clear (the start and
+    goal) are always left traversable so the robot can leave a tight spot and
+    reach a goal that sits next to an obstacle."""
+    if OBSTACLE_INFLATE_CELLS <= 0:
+        return set(blocked)
+    radius = OBSTACLE_INFLATE_CELLS
+    inflated: set[tuple[int, int]] = set()
+    for row, col in blocked:
+        for d_row in range(-radius, radius + 1):
+            for d_col in range(-radius, radius + 1):
+                cell = (row + d_row, col + d_col)
+                if 0 <= cell[0] < GRID_DIM_CELLS and 0 <= cell[1] < GRID_DIM_CELLS:
+                    inflated.add(cell)
+    inflated -= keep_clear
+    return inflated
+
+
 def plan_grid_path(
     start: tuple[int, int],
     goal: tuple[int, int],
@@ -616,6 +644,8 @@ def plan_grid_path(
 ) -> list[tuple[int, int]] | None:
     if start == goal:
         return [start]
+
+    blocked = inflate_blocked(blocked, {start, goal})
 
     queue = deque([start])
     came_from = {start: None}

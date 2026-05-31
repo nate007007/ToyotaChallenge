@@ -85,9 +85,14 @@ int drive_speed_deg_per_sec = 200;
 // ==============================
 // Serial receive buffer
 // ==============================
-const int SERIAL_LINE_BUFFER_SIZE = 512;
+// A full 12-waypoint path_assignment (with a motion block) is ~527 bytes, so
+// the buffer needs headroom past that. The length counter MUST be wide enough
+// to index the whole buffer: a uint8_t wraps at 256 and silently corrupts any
+// message longer than 255 bytes, which is what dropped most dispatch commands.
+const int SERIAL_LINE_BUFFER_SIZE = 768;
 char serialLineBuffer[SERIAL_LINE_BUFFER_SIZE];
-uint8_t serialLineLength = 0;
+uint16_t serialLineLength = 0;
+bool serialLineOverflow = false;
 
 // ==============================
 // Timing
@@ -123,8 +128,10 @@ const float RIGHT_STOP_CLAW_CLOSED_CM = 10.0;
 const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
 // Wall-scan sweep: on hitting a wall mid-path, the robot pivots from
 // -HALF_SWEEP to +HALF_SWEEP, pausing to take SCAN_SAMPLES readings.
-const float SCAN_HALF_SWEEP_DEG = 30.0;
-const int SCAN_SAMPLES = 5;
+// A wider cone with more samples lets the arbiter see where the wall actually
+// ends and find the opening, instead of only reading a narrow patch dead ahead.
+const float SCAN_HALF_SWEEP_DEG = 45.0;
+const int SCAN_SAMPLES = 7;
 const float SCAN_STEP_DEG = (2.0 * SCAN_HALF_SWEEP_DEG) / (SCAN_SAMPLES - 1);
 // If we stop this close to a wall, reverse a little first so there is room to
 // pivot and re-approach at an angle instead of grinding nose-against-wall.
@@ -1124,7 +1131,14 @@ void readFromStream(Stream &stream)
             continue;
         if (c == '\n')
         {
-            if (serialLineLength > 0)
+            if (serialLineOverflow)
+            {
+                // This line overran the buffer; discard it entirely so we
+                // never feed a truncated fragment to the JSON parser.
+                serialLineOverflow = false;
+                serialLineLength = 0;
+            }
+            else if (serialLineLength > 0)
             {
                 serialLineBuffer[serialLineLength] = '\0';
                 if (serialLineLength == 1 &&
@@ -1142,7 +1156,7 @@ void readFromStream(Stream &stream)
                 serialLineLength = 0;
             }
         }
-        else
+        else if (!serialLineOverflow)
         {
             if (serialLineLength < SERIAL_LINE_BUFFER_SIZE - 1)
             {
@@ -1150,7 +1164,8 @@ void readFromStream(Stream &stream)
             }
             else
             {
-                serialLineLength = 0; // drop oversized line
+                // Buffer full before newline: drop the rest of this line.
+                serialLineOverflow = true;
             }
         }
     }
