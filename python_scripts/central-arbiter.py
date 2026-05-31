@@ -48,6 +48,7 @@ REPLAN_WATCHDOG_PERIOD_S = 2.0
 # If a dispatch has been waiting this long for path_complete with no progress,
 # assume the message/round-trip was lost and recover so the robot isn't wedged.
 DISPATCH_STALL_TIMEOUT_S = 8.0
+PLAN_MARGIN_CELLS = 40
 PERMANENT_OBSTACLES_PATH = Path(__file__).with_name("permanent_obstacles.json")
 
 
@@ -103,7 +104,7 @@ def load_permanent_obstacle_cells() -> set[tuple[int, int]]:
             row, col = item
         except (TypeError, ValueError):
             continue
-        cells.add((max(0, min(GRID_DIM_CELLS - 1, int(row))), max(0, min(GRID_DIM_CELLS - 1, int(col)))))
+        cells.add((int(row), int(col)))
     return cells
 
 
@@ -349,13 +350,11 @@ def dispatch_next_waypoint(robot_id: str) -> bool:
 
 
 def clamp_cell(value: int) -> int:
-    return max(0, min(GRID_DIM_CELLS - 1, value))
+    return int(value)
 
 
 def cm_to_cell(x_cm: float, y_cm: float) -> tuple[int, int] | None:
-    if not (0.0 <= x_cm <= ARENA_SIZE_CM and 0.0 <= y_cm <= ARENA_SIZE_CM):
-        return None
-    return clamp_cell(int(y_cm // GRID_CELL_CM)), clamp_cell(int(x_cm // GRID_CELL_CM))
+    return math.floor(y_cm / GRID_CELL_CM), math.floor(x_cm / GRID_CELL_CM)
 
 
 def pose_to_cell(telemetry: dict) -> tuple[int, int] | None:
@@ -625,9 +624,7 @@ def inflate_blocked(
     for row, col in blocked:
         for d_row in range(-radius, radius + 1):
             for d_col in range(-radius, radius + 1):
-                cell = (row + d_row, col + d_col)
-                if 0 <= cell[0] < GRID_DIM_CELLS and 0 <= cell[1] < GRID_DIM_CELLS:
-                    inflated.add(cell)
+                inflated.add((row + d_row, col + d_col))
     return inflated
 
 
@@ -661,6 +658,11 @@ def plan_grid_path(
     if start == goal:
         return [start]
 
+    min_row = min(start[0], goal[0]) - PLAN_MARGIN_CELLS
+    max_row = max(start[0], goal[0]) + PLAN_MARGIN_CELLS
+    min_col = min(start[1], goal[1]) - PLAN_MARGIN_CELLS
+    max_col = max(start[1], goal[1]) + PLAN_MARGIN_CELLS
+
     queue = deque([start])
     came_from = {start: None}
 
@@ -669,7 +671,7 @@ def plan_grid_path(
         for d_row, d_col in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             next_cell = (row + d_row, col + d_col)
             next_row, next_col = next_cell
-            if not (0 <= next_row < GRID_DIM_CELLS and 0 <= next_col < GRID_DIM_CELLS):
+            if not (min_row <= next_row <= max_row and min_col <= next_col <= max_col):
                 continue
             if next_cell in blocked and next_cell != goal:
                 continue

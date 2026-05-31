@@ -45,8 +45,10 @@ class TelemetryGUI:
     RIGHT_SENSOR_LATERAL_OFFSET_CM = -7.0
     RIGHT_SENSOR_ANGLE_OFFSET_DEG = 0.0
 
-    # Arena display settings: fixed 4m x 4m = 400cm x 400cm
+    # Open grid display settings. The old 4m square is only the default view;
+    # goals, obstacles, and routes may use cells outside 0..39.
     ARENA_SIZE_CM = 400
+    DEFAULT_VIEW_MARGIN_CM = 100
     HALF_ARENA_CM = ARENA_SIZE_CM / 2
     GRID_SPACING_CM = 10
     ECHO_WINDOW_S = 10.0
@@ -496,7 +498,7 @@ class TelemetryGUI:
 
         ttk.Label(
             coordination_frame,
-            text="4m x 4m arena split into 40 x 40 cells at 10 cm resolution.",
+            text="Open 10 cm grid. Pan or zoom to place goals and known obstacles outside the default view.",
             wraplength=320,
             justify=tk.LEFT,
             style="Dim.TLabel",
@@ -663,8 +665,8 @@ class TelemetryGUI:
         """Send the armed robot to a clicked point. Heading is set to face the
         direction of travel (old position -> new point) when the move is large
         enough; tiny nudges leave the heading unchanged."""
-        x = max(0.0, min(self.ARENA_SIZE_CM, x_cm))
-        y = max(0.0, min(self.ARENA_SIZE_CM, y_cm))
+        x = float(x_cm)
+        y = float(y_cm)
 
         command = {
             "type": "set_pose",
@@ -781,10 +783,8 @@ class TelemetryGUI:
             hist["right_echo_y"].pop(0)
 
     def _remember_obstacle_cell(self, x_cm: float, y_cm: float, t_s: float | None):
-        if not (0.0 <= x_cm <= self.ARENA_SIZE_CM and 0.0 <= y_cm <= self.ARENA_SIZE_CM):
-            return
-        row = int(y_cm // self.GRID_SPACING_CM)
-        col = int(x_cm // self.GRID_SPACING_CM)
+        row = math.floor(y_cm / self.GRID_SPACING_CM)
+        col = math.floor(x_cm / self.GRID_SPACING_CM)
         self.obstacle_cells[(row, col)] = t_s if t_s is not None else time.time()
 
     def _prune_obstacle_cells(self, current_t_s: float):
@@ -1012,10 +1012,7 @@ class TelemetryGUI:
                 row, col = item
             except (TypeError, ValueError):
                 continue
-            cells.add((
-                max(0, min(self.GRID_DIM_CELLS - 1, int(row))),
-                max(0, min(self.GRID_DIM_CELLS - 1, int(col))),
-            ))
+            cells.add((int(row), int(col)))
         return cells
 
     def _save_permanent_obstacles(self) -> None:
@@ -1023,8 +1020,8 @@ class TelemetryGUI:
         self.PERMANENT_OBSTACLES_PATH.write_text(json.dumps(raw_cells, indent=2), encoding="utf-8")
 
     def _set_priority_goal_cell(self, row: int, col: int, source: str = "manual") -> None:
-        row = max(0, min(self.GRID_DIM_CELLS - 1, int(row)))
-        col = max(0, min(self.GRID_DIM_CELLS - 1, int(col)))
+        row = int(row)
+        col = int(col)
         self.priority_goal_cell = (row, col)
         self.priority_goal_cm = self._cell_center_cm(self.priority_goal_cell)
 
@@ -1048,8 +1045,6 @@ class TelemetryGUI:
             return
         if event.inaxes != self.ax_traj or event.xdata is None or event.ydata is None:
             return
-        if not (0.0 <= event.xdata <= self.ARENA_SIZE_CM and 0.0 <= event.ydata <= self.ARENA_SIZE_CM):
-            return
 
         # Click-to-teleport, step 2: a robot is armed, so this click is its
         # destination. Clicking the armed robot again cancels.
@@ -1072,8 +1067,8 @@ class TelemetryGUI:
             self._refresh_plot()
             return
 
-        col = int(event.xdata // self.GRID_SPACING_CM)
-        row = int(event.ydata // self.GRID_SPACING_CM)
+        col = math.floor(event.xdata / self.GRID_SPACING_CM)
+        row = math.floor(event.ydata / self.GRID_SPACING_CM)
         if self.map_click_mode_var.get() == "obstacle":
             self._toggle_permanent_obstacle(row, col)
         else:
@@ -1098,10 +1093,7 @@ class TelemetryGUI:
         return best_id
 
     def _toggle_permanent_obstacle(self, row: int, col: int) -> None:
-        cell = (
-            max(0, min(self.GRID_DIM_CELLS - 1, int(row))),
-            max(0, min(self.GRID_DIM_CELLS - 1, int(col))),
-        )
+        cell = (int(row), int(col))
         if cell in self.permanent_obstacle_cells:
             self.permanent_obstacle_cells.remove(cell)
         else:
@@ -1195,14 +1187,6 @@ class TelemetryGUI:
         self.ax_traj.tick_params(colors=self.C_TEXT_DIM, labelsize=8)
         for spine in self.ax_traj.spines.values():
             spine.set_edgecolor(self.C_BORDER)
-
-        # Arena boundary outline (0-400 cm)
-        self.ax_traj.add_patch(
-            Rectangle(
-                (0, 0), self.ARENA_SIZE_CM, self.ARENA_SIZE_CM,
-                fill=False, edgecolor=self.C_RED, linewidth=1.4, alpha=0.55,
-            )
-        )
 
         for row, col in self.obstacle_cells:
             self.ax_traj.add_patch(
@@ -1383,8 +1367,8 @@ class TelemetryGUI:
             self.ax_traj.set_xlim(cur_xlim)
             self.ax_traj.set_ylim(cur_ylim)
         else:
-            self.ax_traj.set_xlim(0, self.ARENA_SIZE_CM)
-            self.ax_traj.set_ylim(0, self.ARENA_SIZE_CM)
+            self.ax_traj.set_xlim(-self.DEFAULT_VIEW_MARGIN_CM, self.ARENA_SIZE_CM + self.DEFAULT_VIEW_MARGIN_CM)
+            self.ax_traj.set_ylim(-self.DEFAULT_VIEW_MARGIN_CM, self.ARENA_SIZE_CM + self.DEFAULT_VIEW_MARGIN_CM)
 
         self.canvas.draw_idle()
     
@@ -1459,8 +1443,8 @@ class TelemetryGUI:
         theta_rad = math.radians(theta_deg)
         distance_cm = self._get_test_distance_cm()
 
-        wp_x = min(max(x + distance_cm * math.cos(theta_rad), 0.0), 400.0)
-        wp_y = min(max(y + distance_cm * math.sin(theta_rad), 0.0), 400.0)
+        wp_x = x + distance_cm * math.cos(theta_rad)
+        wp_y = y + distance_cm * math.sin(theta_rad)
 
         msg = PathAssignmentMessage(
             robot_id=robot_id,
@@ -1495,8 +1479,8 @@ class TelemetryGUI:
         theta_rad = math.radians(theta_deg)
         distance_cm = self._get_test_distance_cm()
 
-        wp_x = min(max(x - distance_cm * math.cos(theta_rad), 0.0), 400.0)
-        wp_y = min(max(y - distance_cm * math.sin(theta_rad), 0.0), 400.0)
+        wp_x = x - distance_cm * math.cos(theta_rad)
+        wp_y = y - distance_cm * math.sin(theta_rad)
 
         msg = PathAssignmentMessage(
             robot_id=robot_id,
@@ -1520,15 +1504,15 @@ class TelemetryGUI:
         x = float(robot_state.get("x_cm", 0.0))
         y = float(robot_state.get("y_cm", 0.0))
 
-        # Simple "Γ"-shaped test path, clipped to the 0..400 cm arena
-        wp1_x = min(max(x + 20.0, 0.0), 400.0)
-        wp1_y = min(max(y,         0.0), 400.0)
+        # Simple L-shaped test path in the open global grid.
+        wp1_x = x + 20.0
+        wp1_y = y
 
-        wp2_x = min(max(x + 40.0, 0.0), 400.0)
-        wp2_y = min(max(y,         0.0), 400.0)
+        wp2_x = x + 40.0
+        wp2_y = y
 
-        wp3_x = min(max(x + 40.0, 0.0), 400.0)
-        wp3_y = min(max(y + 40.0, 0.0), 400.0)
+        wp3_x = x + 40.0
+        wp3_y = y + 40.0
 
         msg = PathAssignmentMessage(
             robot_id=robot_id,
@@ -1551,9 +1535,6 @@ class TelemetryGUI:
         except (TypeError, ValueError):
             return None
 
-        if not (0 <= row < self.GRID_DIM_CELLS and 0 <= col < self.GRID_DIM_CELLS):
-            return None
-
         return row, col
 
     def _send_two_robot_traverse(self):
@@ -1569,7 +1550,7 @@ class TelemetryGUI:
         goal_one = self._parse_goal_cell(self.grid_robot_one_row_var, self.grid_robot_one_col_var)
         goal_two = self._parse_goal_cell(self.grid_robot_two_row_var, self.grid_robot_two_col_var)
         if goal_one is None or goal_two is None:
-            self.grid_plan_summary_var.set("Goal cells must be integers from 0 to 39.")
+            self.grid_plan_summary_var.set("Goal cells must be integers.")
             return
 
         if goal_one == goal_two:
@@ -1595,7 +1576,7 @@ class TelemetryGUI:
 
         goal = self._parse_goal_cell(self.priority_goal_row_var, self.priority_goal_col_var)
         if goal is None:
-            self.task_summary_var.set("Goal cells must be integers from 0 to 39.")
+            self.task_summary_var.set("Goal cells must be integers.")
             return
 
         self._set_priority_goal_cell(goal[0], goal[1])

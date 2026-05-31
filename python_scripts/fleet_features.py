@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -36,8 +37,8 @@ def pose_to_cell_from_telemetry(telemetry: dict) -> tuple[int, int] | None:
     except (KeyError, TypeError, ValueError):
         return None
 
-    col = max(0, min(39, int(x_cm // GRID_CELL_CM)))
-    row = max(0, min(39, int(y_cm // GRID_CELL_CM)))
+    col = math.floor(x_cm / GRID_CELL_CM)
+    row = math.floor(y_cm / GRID_CELL_CM)
     return row, col
 
 
