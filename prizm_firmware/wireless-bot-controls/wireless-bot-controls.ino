@@ -74,6 +74,7 @@ unsigned long gripper_settle_until_ms = 0;
 bool scanning = false;
 int scan_index = 0;
 bool scan_recentering = false;
+bool scan_backing = false;
 
 const float POSITION_TOLERANCE_CM = 2.0;
 const float HEADING_TOLERANCE_DEG = 4.0;
@@ -125,6 +126,10 @@ const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
 const float SCAN_HALF_SWEEP_DEG = 30.0;
 const int SCAN_SAMPLES = 5;
 const float SCAN_STEP_DEG = (2.0 * SCAN_HALF_SWEEP_DEG) / (SCAN_SAMPLES - 1);
+// If we stop this close to a wall, reverse a little first so there is room to
+// pivot and re-approach at an angle instead of grinding nose-against-wall.
+const int SCAN_BACKUP_TRIGGER_CM = 18;
+const float SCAN_BACKUP_DISTANCE_CM = 8.0;
 int cached_front_ir_raw = -1;
 int cached_left_ir_raw = -1;
 int cached_front_ir_cm = -1;
@@ -473,6 +478,7 @@ void interruptActivePrimitive()
     resetEncoderTracking();
     scanning = false;
     scan_recentering = false;
+    scan_backing = false;
     scan_index = 0;
 }
 
@@ -561,9 +567,20 @@ void beginObstacleScan()
     scanning = true;
     scan_index = 0;
     scan_recentering = false;
+    scan_backing = false;
     setRobotState("scanning");
     sendStatus("scanning", "wall_scan_start");
-    startTurnInPlace(-SCAN_HALF_SWEEP_DEG);
+
+    // Reverse first if we are pinned against the wall, then sweep.
+    if (cached_front_ultrasonic_cm > 0 && cached_front_ultrasonic_cm < SCAN_BACKUP_TRIGGER_CM)
+    {
+        scan_backing = true;
+        startDriveStraight(-SCAN_BACKUP_DISTANCE_CM);
+    }
+    else
+    {
+        startTurnInPlace(-SCAN_HALF_SWEEP_DEG);
+    }
 }
 
 void captureScanSample()
@@ -580,6 +597,14 @@ void updateScan()
     updateOdometry();
     if (motorsBusy())
         return;
+
+    if (scan_backing)
+    {
+        // Finished reversing; now we have room to sweep.
+        scan_backing = false;
+        startTurnInPlace(-SCAN_HALF_SWEEP_DEG);
+        return;
+    }
 
     if (scan_recentering)
     {
