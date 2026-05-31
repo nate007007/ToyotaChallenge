@@ -919,7 +919,7 @@ def gui_command_sender(message_obj):
         if message.get("type") == "path_assignment":
             ok = queue_robot_path(message)
         else:
-            if message.get("type") in {"stop", "continuous_drive"}:
+            if message.get("type") in {"stop", "continuous_drive", "set_pose"}:
                 # Operator override cancels the autonomous goal so the watchdog
                 # stops trying to drive the old route.
                 clear_active_goal(robot_id)

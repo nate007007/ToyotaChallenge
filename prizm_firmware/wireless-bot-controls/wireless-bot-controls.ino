@@ -123,6 +123,10 @@ const bool USE_ULTRASONIC_SENSORS = true;
 const int RIGHT_FORWARD_ULTRASONIC_PIN = 3;
 const int CLAW_ULTRASONIC_PIN = 4;
 const int LEFT_FORWARD_ULTRASONIC_PIN = 5;
+// On arrival the robot only auto-closes the gripper if the claw ultrasonic sees
+// an object within this many cm -- otherwise it would clamp on empty air at a
+// destination that has nothing to pick up.
+const float CLAW_PICKUP_MAX_CM = 12.0;
 // Stop clearances measured at the two forward ultrasonics, in cm.
 // Each side has its own target gap, and the gap shrinks when the claw is
 // closed (the claw extends the robot's reach, so it can approach closer).
@@ -1022,6 +1026,45 @@ void performStop()
     printPoseJSON();
 }
 
+// Override the robot's tracked pose to match where the operator dropped it on
+// the GUI map. Odometry is delta-based (it tracks the previous encoder reading),
+// so simply overwriting x/y/theta makes all subsequent motion continue from the
+// new pose. Any active motion is cancelled because its targets were computed
+// against the old, now-wrong pose.
+void performSetPose(float new_x_cm, float new_y_cm, bool has_theta, float new_theta_deg)
+{
+    interruptActivePrimitive();
+    clearCurrentPath();
+    path_paused = false;
+
+    x_cm = new_x_cm;
+    y_cm = new_y_cm;
+    if (has_theta)
+        theta_rad = normalizeAngle(degToRad(new_theta_deg));
+
+    setRobotState("idle");
+    sendAck("set_pose");
+    sendStatus("idle", "pose_set");
+    printPoseJSON();
+}
+
+void handleSetPose(const char *json)
+{
+    if (!jsonTargetsThisRobot(json))
+        return;
+
+    float new_x = x_cm;
+    float new_y = y_cm;
+    bool has_x = extractFloatField(json, "x_cm", new_x);
+    bool has_y = extractFloatField(json, "y_cm", new_y);
+    if (!has_x || !has_y)
+        return;
+
+    float new_theta_deg = 0.0;
+    bool has_theta = extractFloatField(json, "theta_deg", new_theta_deg);
+    performSetPose(new_x, new_y, has_theta, new_theta_deg);
+}
+
 void performToggleGripper()
 {
     gripper_closed = !gripper_closed;
@@ -1032,6 +1075,28 @@ void performToggleGripper()
 
     sendAck("toggle_gripper");
     sendStatus(robot_state, gripper_closed ? "gripper_closed" : "gripper_opened");
+}
+
+// Close the gripper to grab whatever the robot has just driven up to. Called
+// when a route finishes: the destination is assumed to hold the target object.
+// If the gripper is already closed the robot is already carrying something, so
+// we leave it alone rather than crushing/dropping the current payload.
+void performGrabOnArrival()
+{
+    if (gripper_closed)
+        return;
+
+    // Only clamp if the claw sensor actually sees an object within reach.
+    if (cached_claw_ultrasonic_cm <= 0 || cached_claw_ultrasonic_cm > CLAW_PICKUP_MAX_CM)
+        return;
+
+    gripper_closed = true;
+    gripper_target_deg = GRIPPER_CLOSED_DEG;
+    prizm.setServoSpeed(GRIPPER_SERVO_ID, GRIPPER_SERVO_SPEED_PERCENT);
+    prizm.setServoPosition(GRIPPER_SERVO_ID, gripper_target_deg);
+    gripper_settle_until_ms = millis() + GRIPPER_SETTLE_MS;
+
+    sendStatus(robot_state, "gripper_closed");
 }
 
 // Re-assert the latest gripper target for a short window so an I2C write that
@@ -1125,6 +1190,10 @@ void handleIncomingJson(const char *json)
     else if (jsonHasType(json, "toggle_gripper"))
     {
         handleToggleGripper(json);
+    }
+    else if (jsonHasType(json, "set_pose"))
+    {
+        handleSetPose(json);
     }
 }
 
@@ -1243,6 +1312,7 @@ void maybeStartNextPrimitive()
 
     if (current_waypoint_index < 0 || current_waypoint_index >= waypoint_count)
     {
+        performGrabOnArrival();
         sendPathComplete();
         clearCurrentPath();
         setRobotState("idle");
@@ -1262,6 +1332,7 @@ void maybeStartNextPrimitive()
 
         if (current_waypoint_index >= waypoint_count)
         {
+            performGrabOnArrival();
             sendPathComplete();
             clearCurrentPath();
             setRobotState("idle");
