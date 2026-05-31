@@ -65,6 +65,11 @@ bool path_paused = false;
 bool path_started_sent = false;
 bool gripper_closed = false;
 
+// Wall-scan state machine (see beginObstacleScan/updateScan).
+bool scanning = false;
+int scan_index = 0;
+bool scan_recentering = false;
+
 const float POSITION_TOLERANCE_CM = 2.0;
 const float HEADING_TOLERANCE_DEG = 4.0;
 
@@ -110,6 +115,11 @@ const float LEFT_STOP_CLAW_CLOSED_CM = 13.0;
 const float RIGHT_STOP_CLAW_OPEN_CM = 12.5;
 const float RIGHT_STOP_CLAW_CLOSED_CM = 10.0;
 const int DEFAULT_CONTINUOUS_MOTOR_POWER = 35;
+// Wall-scan sweep: on hitting a wall mid-path, the robot pivots from
+// -HALF_SWEEP to +HALF_SWEEP, pausing to take SCAN_SAMPLES readings.
+const float SCAN_HALF_SWEEP_DEG = 30.0;
+const int SCAN_SAMPLES = 5;
+const float SCAN_STEP_DEG = (2.0 * SCAN_HALF_SWEEP_DEG) / (SCAN_SAMPLES - 1);
 int cached_front_ir_raw = -1;
 int cached_left_ir_raw = -1;
 int cached_front_ir_cm = -1;
@@ -323,7 +333,12 @@ void maybeUpdateSensors()
     if (now - lastSensorReadMs < SENSOR_READ_PERIOD_MS)
         return;
 
-    if (USE_ULTRASONIC_SENSORS)
+    // Only pay the blocking pulseIn cost while actually driving forward. When
+    // idle/turning the loop stays fast so GUI commands are acted on promptly.
+    bool active_drive =
+        (active_primitive == PRIM_DRIVE || active_primitive == PRIM_CONT_DRIVE);
+
+    if (USE_ULTRASONIC_SENSORS && active_drive)
     {
         int raw_right = readSonicSensorCMFast(RIGHT_FORWARD_ULTRASONIC_PIN);
         int raw_left = readSonicSensorCMFast(LEFT_FORWARD_ULTRASONIC_PIN);
@@ -451,6 +466,9 @@ void interruptActivePrimitive()
 
     stopMotorsNow();
     resetEncoderTracking();
+    scanning = false;
+    scan_recentering = false;
+    scan_index = 0;
 }
 
 void startDriveStraight(float distance_cm)
@@ -528,32 +546,83 @@ bool frontObstacleDetected()
     return leftObstacleDetected() || rightObstacleDetected();
 }
 
+// Sweep the two forward ultrasonics across the wall so the arbiter learns its
+// extent, then ask for a replan. The robot pivots to one side, takes a reading
+// at each of SCAN_SAMPLES headings, and recenters before reporting needs_replan.
+void beginObstacleScan()
+{
+    interruptActivePrimitive();
+    path_paused = true;
+    scanning = true;
+    scan_index = 0;
+    scan_recentering = false;
+    setRobotState("scanning");
+    sendStatus("scanning", "wall_scan_start");
+    startTurnInPlace(-SCAN_HALF_SWEEP_DEG);
+}
+
+void captureScanSample()
+{
+    cached_right_ultrasonic_cm = readSonicSensorCMFast(RIGHT_FORWARD_ULTRASONIC_PIN);
+    cached_left_ultrasonic_cm = readSonicSensorCMFast(LEFT_FORWARD_ULTRASONIC_PIN);
+    cached_front_ultrasonic_cm =
+        closestValidDistance(cached_right_ultrasonic_cm, cached_left_ultrasonic_cm);
+    printPoseJSON();
+}
+
+void updateScan()
+{
+    updateOdometry();
+    if (motorsBusy())
+        return;
+
+    if (scan_recentering)
+    {
+        scanning = false;
+        active_primitive = PRIM_NONE;
+        leftCloseStreak = 0;
+        rightCloseStreak = 0;
+        setRobotState("needs_replan");
+        sendStatus("needs_replan", "wall_scan_complete");
+        printPoseJSON();
+        return;
+    }
+
+    captureScanSample();
+    scan_index++;
+    if (scan_index < SCAN_SAMPLES)
+    {
+        startTurnInPlace(SCAN_STEP_DEG);
+    }
+    else
+    {
+        scan_recentering = true;
+        startTurnInPlace(-SCAN_HALF_SWEEP_DEG);
+    }
+}
+
 // A confirmed forward obstacle is a hard stop in both drive modes. Manual
 // continuous driving simply halts and reports "blocked". Autonomous path
-// driving halts and asks the arbiter to replan around the newly seen wall,
-// since blindly pivoting can't know which way is actually clear.
+// driving scans the wall and asks the arbiter to replan around it.
 void maybeReactiveAvoidance()
 {
+    if (scanning)
+        return;
     if (active_primitive != PRIM_DRIVE && active_primitive != PRIM_CONT_DRIVE)
         return;
     if (!frontObstacleDetected())
         return;
 
-    PrimitiveType blocked_mode = active_primitive;
-    interruptActivePrimitive();
-
-    if (blocked_mode == PRIM_CONT_DRIVE)
+    if (active_primitive == PRIM_CONT_DRIVE)
     {
+        interruptActivePrimitive();
         setRobotState("blocked");
         sendStatus("blocked", "continuous_drive_obstacle");
         printPoseJSON();
         return;
     }
 
-    path_paused = true;
-    setRobotState("needs_replan");
-    sendStatus("needs_replan", "forward_clearance_reached");
-    printPoseJSON();
+    beginObstacleScan();
 }
 
 // ==============================
@@ -1058,6 +1127,11 @@ void readSerialCommands()
 // ==============================
 void updateActivePrimitive()
 {
+    if (scanning)
+    {
+        updateScan();
+        return;
+    }
     if (active_primitive == PRIM_NONE)
         return;
 
@@ -1091,6 +1165,8 @@ void updateActivePrimitive()
 
 void maybeStartNextPrimitive()
 {
+    if (scanning)
+        return;
     if (!path_loaded)
         return;
     if (path_paused)
